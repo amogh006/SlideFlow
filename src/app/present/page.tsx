@@ -7,48 +7,184 @@ import Link from 'next/link';
 import { useAppContext } from '@/context/AppContext';
 import {
   Carousel,
+  CarouselApi,
   CarouselContent,
   CarouselItem,
   CarouselNext,
   CarouselPrevious,
 } from '@/components/ui/carousel';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent } from '@/components/ui/card';
-import { Expand, Shrink, X } from 'lucide-react';
+import { Expand, Mic, Shrink, X } from 'lucide-react';
+
+// Helper to decode Base64
+const decodeBase64 = (base64: string) => {
+  const binaryString = window.atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes.buffer;
+};
 
 export default function PresentPage() {
-  const { isAuthenticated, slides } = useAppContext();
+  const { isAuthenticated, slides, presentationScript } = useAppContext();
   const router = useRouter();
   const [isFullScreen, setIsFullScreen] = useState(false);
   const carouselContainerRef = useRef<HTMLDivElement>(null);
+  const [api, setApi] = useState<CarouselApi>();
+  const ws = useRef<WebSocket | null>(null);
+  const audioQueue = useRef<AudioBuffer[]>([]);
+  const audioContext = useRef<AudioContext | null>(null);
+  const isPlaying = useRef(false);
+  const [currentCaption, setCurrentCaption] = useState('');
+  const [currentSlideIndex, setCurrentSlideIndex] = useState(0);
 
   useEffect(() => {
-    if (!isAuthenticated || slides.length === 0) {
+    if (!isAuthenticated || slides.length === 0 || !presentationScript) {
       router.push('/upload');
     }
-  }, [isAuthenticated, slides, router]);
+  }, [isAuthenticated, slides, presentationScript, router]);
+
+  const playNextAudioChunk = async () => {
+    if (isPlaying.current || audioQueue.current.length === 0) {
+      return;
+    }
+    isPlaying.current = true;
+
+    if (!audioContext.current) {
+      try {
+        audioContext.current = new (window.AudioContext || window.webkitAudioContext)();
+      } catch (e) {
+        console.error("Web Audio API is not supported in this browser", e);
+        isPlaying.current = false;
+        return;
+      }
+    }
+    
+    await audioContext.current.resume();
+    const audioBuffer = audioQueue.current.shift()!;
+    const source = audioContext.current.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(audioContext.current.destination);
+    source.onended = () => {
+      isPlaying.current = false;
+      playNextAudioChunk();
+    };
+    source.start();
+  };
+
+  useEffect(() => {
+    if (!presentationScript || ws.current) return;
+
+    ws.current = new WebSocket('ws://147.93.102.137:8000/ws/presentation');
+
+    ws.current.onopen = () => {
+      console.log('WebSocket connected');
+      // Load presentation into WebSocket session
+      ws.current?.send(
+        JSON.stringify({
+          type: 'load_presentation',
+          data: presentationScript,
+        })
+      );
+    };
+
+    ws.current.onmessage = async (event) => {
+      const message = JSON.parse(event.data);
+
+      switch (message.type) {
+        case 'connected':
+          console.log(message.message);
+          break;
+        case 'presentation_loaded':
+          console.log(message.message);
+          // Automatically start the first slide
+          if (api) {
+             api.scrollTo(0);
+          }
+          break;
+        case 'audio_chunk':
+          try {
+            const audioData = decodeBase64(message.audio_data);
+             if (audioContext.current) {
+                const audioBuffer = await audioContext.current.decodeAudioData(audioData);
+                audioQueue.current.push(audioBuffer);
+                playNextAudioChunk();
+            }
+          } catch (e) {
+            console.error("Error decoding audio data:", e);
+          }
+          break;
+        case 'slide_started':
+          setCurrentCaption(presentationScript.slides[message.slide_number - 1].script);
+          break;
+        case 'slide_done':
+           setCurrentCaption('');
+           break;
+        case 'qa_response':
+            setCurrentCaption(`Q: ${message.question}\nA: ${message.answer}`);
+            try {
+              const audioData = decodeBase64(message.audio_data);
+               if (audioContext.current) {
+                  const audioBuffer = await audioContext.current.decodeAudioData(audioData);
+                  audioQueue.current.push(audioBuffer);
+                  playNextAudioChunk();
+              }
+            } catch (e) {
+              console.error("Error decoding audio data:", e);
+            }
+            break;
+        case 'error':
+          console.error(`WebSocket Error: ${message.message}`);
+          break;
+      }
+    };
+
+    ws.current.onclose = () => {
+      console.log('WebSocket disconnected');
+    };
+
+    ws.current.onerror = (error) => {
+      console.error('WebSocket error:', error);
+    };
+
+    return () => {
+      ws.current?.close();
+    };
+  }, [presentationScript, api]);
+
+  useEffect(() => {
+    if (!api) {
+      return;
+    }
+ 
+    const handleSelect = () => {
+        const newSlideIndex = api.selectedScrollSnap();
+        if (ws.current && ws.current.readyState === WebSocket.OPEN && newSlideIndex !== currentSlideIndex) {
+            setCurrentSlideIndex(newSlideIndex);
+            audioQueue.current = []; // Clear queue for new slide
+            isPlaying.current = false;
+            if(audioContext.current?.state === 'running') {
+                audioContext.current.suspend();
+            }
+            ws.current.send(JSON.stringify({ type: 'slide_start', slide_number: newSlideIndex + 1 }));
+        }
+    }
+    api.on('select', handleSelect);
+
+    // Start first slide
+    handleSelect();
+
+    return () => {
+      api.off('select', handleSelect);
+    };
+  }, [api, currentSlideIndex]);
+
 
   const handleFullScreenChange = () => {
     setIsFullScreen(!!document.fullscreenElement);
   };
-
-  useEffect(() => {
-    document.addEventListener('fullscreenchange', handleFullScreenChange);
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'f') {
-        toggleFullScreen();
-      }
-      if (e.key === 'Escape' && document.fullscreenElement) {
-        document.exitFullscreen();
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-
-    return () => {
-      document.removeEventListener('fullscreenchange', handleFullScreenChange);
-      window.removeEventListener('keydown', handleKeyDown);
-    };
-  }, []);
 
   const toggleFullScreen = () => {
     const element = carouselContainerRef.current;
@@ -56,12 +192,32 @@ export default function PresentPage() {
 
     if (!document.fullscreenElement) {
       element.requestFullscreen().catch((err) => {
-        console.error(
-          `Error attempting to enable full-screen mode: ${err.message} (${err.name})`
-        );
+        console.error(`Error attempting to enable full-screen mode: ${err.message} (${err.name})`);
       });
     } else {
       document.exitFullscreen();
+    }
+  };
+
+  useEffect(() => {
+    document.addEventListener('fullscreenchange', handleFullScreenChange);
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'f') toggleFullScreen();
+      if (e.key === 'Escape' && document.fullscreenElement) document.exitFullscreen();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+
+    return () => {
+      document.removeEventListener('fullscreenchange', handleFullScreenChange);
+       window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, []);
+
+  const handleInterrupt = () => {
+    if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+      const question = "Can you explain this slide in simpler terms?"; // Hardcoded question
+      ws.current.send(JSON.stringify({ type: 'interrupt', question }));
+      setCurrentCaption(`Asking: "${question}"`);
     }
   };
 
@@ -74,7 +230,7 @@ export default function PresentPage() {
       ref={carouselContainerRef}
       className="bg-gray-900 text-white w-full h-screen flex flex-col items-center justify-center relative group"
     >
-      <Carousel className="w-full h-full" opts={{ loop: true }}>
+      <Carousel setApi={setApi} className="w-full h-full" opts={{ loop: false }}>
         <CarouselContent className="h-full">
           {slides.map((slideUrl, index) => (
             <CarouselItem key={index} className="h-full">
@@ -94,18 +250,27 @@ export default function PresentPage() {
         <CarouselNext className="absolute right-8 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity bg-black/50 hover:bg-black/75 border-none text-white h-12 w-12" />
       </Carousel>
 
+      <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-black/80 to-transparent">
+        <p className="text-center text-xl whitespace-pre-wrap">{currentCaption}</p>
+      </div>
+
       <div className="absolute top-4 right-4 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={handleInterrupt}
+          className="text-white hover:bg-white/10 hover:text-white"
+        >
+          <Mic className="h-5 w-5" />
+          <span className="sr-only">Ask a question</span>
+        </Button>
         <Button
           variant="ghost"
           size="icon"
           onClick={toggleFullScreen}
           className="text-white hover:bg-white/10 hover:text-white"
         >
-          {isFullScreen ? (
-            <Shrink className="h-5 w-5" />
-          ) : (
-            <Expand className="h-5 w-5" />
-          )}
+          {isFullScreen ? <Shrink className="h-5 w-5" /> : <Expand className="h-5 w-5" />}
           <span className="sr-only">Toggle Fullscreen</span>
         </Button>
         <Button

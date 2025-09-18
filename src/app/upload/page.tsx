@@ -6,10 +6,11 @@ import Image from 'next/image';
 import { useAppContext } from '@/context/AppContext';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
-import { UploadCloud, X, Presentation, LogOut, Loader2 } from 'lucide-react';
-import { PlaceHolderImages } from '@/lib/placeholder-images';
+import { UploadCloud, X, Presentation, LogOut, Loader2, KeyRound } from 'lucide-react';
 import Link from 'next/link';
 import { useToast } from '@/hooks/use-toast';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 
 export default function UploadPage() {
   const {
@@ -21,6 +22,9 @@ export default function UploadPage() {
     slides,
     isLoading,
     setIsLoading,
+    setPresentationScript,
+    apiKey,
+    setApiKey,
   } = useAppContext();
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -32,9 +36,57 @@ export default function UploadPage() {
     }
   }, [isAuthenticated, router]);
 
+  const generateScript = async (slidesResponse: any, title: string) => {
+    const scriptFormData = new FormData();
+    const blob = new Blob([JSON.stringify(slidesResponse)], { type: 'application/json' });
+    scriptFormData.append('file', blob, 'slides_response.json');
+    scriptFormData.append('presentation_title', title);
+    scriptFormData.append('openai_api_key', apiKey);
+  
+    try {
+      const response = await fetch('/api/generate-script', {
+        method: 'POST',
+        body: scriptFormData,
+      });
+  
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.detail || 'Failed to generate script.');
+      }
+  
+      const scriptData = await response.json();
+      setPresentationScript(scriptData);
+      toast({
+        title: 'Script Generated',
+        description: 'Your presentation script is ready.',
+      });
+    } catch (error) {
+       console.error('Error generating script:', error);
+       toast({
+         title: 'Script Generation Failed',
+         description:
+           error instanceof Error
+             ? error.message
+             : 'An unknown error occurred.',
+         variant: 'destructive',
+       });
+    }
+  };
+
   const processFile = async (selectedFile: File) => {
+    if (!apiKey) {
+      toast({
+        title: 'API Key Required',
+        description: 'Please enter your OpenAI API key to proceed.',
+        variant: 'destructive',
+      });
+      return;
+    }
+
     setFile(selectedFile);
     setIsLoading(true);
+    setSlides([]);
+    setPresentationScript(null);
 
     const formData = new FormData();
     formData.append('file', selectedFile);
@@ -58,6 +110,7 @@ export default function UploadPage() {
             `data:${slide.content_type};base64,${slide.image_data}`
         );
         setSlides(imageUrls);
+        await generateScript(data, selectedFile.name);
       } else {
         throw new Error('Invalid response from server.');
       }
@@ -109,6 +162,7 @@ export default function UploadPage() {
   const handleRemoveFile = () => {
     setFile(null);
     setSlides([]);
+    setPresentationScript(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -137,22 +191,45 @@ export default function UploadPage() {
       </header>
       <main className="flex-1 p-4 md:p-8 lg:p-12">
         <div className="max-w-6xl mx-auto">
-          <h1 className="text-3xl font-bold mb-2">Upload Your Presentation</h1>
-          <p className="text-muted-foreground mb-8">
-            Upload a .ppt or .pptx file to get started. We'll generate a preview
-            for you.
-          </p>
+          <div className="mb-8">
+            <h1 className="text-3xl font-bold mb-2">Upload Your Presentation</h1>
+            <p className="text-muted-foreground">
+              Upload a .ppt or .pptx file. We'll generate a preview and a
+              presentation script.
+            </p>
+          </div>
+
+          <Card className="mb-8 p-6 bg-card/30">
+            <div className="space-y-2">
+              <Label htmlFor="api-key" className="flex items-center gap-2">
+                <KeyRound className="h-4 w-4" />
+                OpenAI API Key
+              </Label>
+              <Input
+                id="api-key"
+                type="password"
+                placeholder="Enter your OpenAI API key"
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+              />
+              <p className="text-sm text-muted-foreground">
+                Your API key is used to generate the presentation script. It is
+                not stored.
+              </p>
+            </div>
+          </Card>
+
 
           {!file ? (
             <div
               className={`w-full border-2 border-dashed rounded-lg p-12 flex flex-col items-center justify-center text-center transition-colors bg-card/30 ${
-                isLoading
+                isLoading || !apiKey
                   ? 'cursor-not-allowed'
                   : 'cursor-pointer hover:border-primary'
               }`}
-              onClick={() => !isLoading && fileInputRef.current?.click()}
+              onClick={() => !(isLoading || !apiKey) && fileInputRef.current?.click()}
               onDragOver={handleDragOver}
-              onDrop={isLoading ? undefined : handleDrop}
+              onDrop={isLoading || !apiKey ? undefined : handleDrop}
             >
               {isLoading ? (
                 <>
@@ -161,7 +238,7 @@ export default function UploadPage() {
                     Processing your presentation...
                   </p>
                   <p className="text-muted-foreground">
-                    This may take a moment.
+                    This may take a moment. Generating script...
                   </p>
                 </>
               ) : (
@@ -171,7 +248,8 @@ export default function UploadPage() {
                     Drag & drop your file here
                   </p>
                   <p className="text-muted-foreground mb-4">or</p>
-                  <Button type="button">Browse Files</Button>
+                  <Button type="button" disabled={!apiKey}>Browse Files</Button>
+                  {!apiKey && <p className="text-sm text-destructive mt-4">Please enter your OpenAI API key to upload.</p>}
                 </>
               )}
               <input
@@ -180,7 +258,7 @@ export default function UploadPage() {
                 className="hidden"
                 onChange={handleFileChange}
                 accept=".ppt,.pptx,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                disabled={isLoading}
+                disabled={isLoading || !apiKey}
               />
             </div>
           ) : (
