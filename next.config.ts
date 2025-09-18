@@ -30,14 +30,6 @@ const nextConfig: NextConfig = {
       },
     ],
   },
-  async rewrites() {
-    return [
-      {
-        source: '/api/proxy/:path*',
-        destination: 'http://147.93.102.137:8000/:path*',
-      },
-    ]
-  },
 };
 
 export default nextConfig;
