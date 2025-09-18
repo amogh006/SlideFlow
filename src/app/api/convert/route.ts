@@ -19,26 +19,26 @@ export async function POST(request: NextRequest) {
     });
 
     if (!backendResponse.ok) {
-      const errorData = await backendResponse.text();
+      const errorText = await backendResponse.text();
       // Try to parse as JSON, but fallback to text if it fails
       try {
-        const jsonData = JSON.parse(errorData);
-        return NextResponse.json(jsonData, {status: backendResponse.status});
+        const errorJson = JSON.parse(errorText);
+        return NextResponse.json(errorJson, {status: backendResponse.status});
       } catch (e) {
-        return new NextResponse(errorData, {status: backendResponse.status});
+        return new NextResponse(errorText, {status: backendResponse.status, headers: {'Content-Type': 'application/json'}});
       }
     }
 
     const data = await backendResponse.json();
     return NextResponse.json(data);
   } catch (error) {
-    console.error('Proxy error:', error);
+    console.error('Proxy error in /api/convert:', error);
     let errorMessage = 'An unknown error occurred in the proxy.';
     if (error instanceof Error) {
       errorMessage = error.message;
     }
     return NextResponse.json(
-      {detail: errorMessage},
+      {detail: `Proxy error: ${errorMessage}`},
       {status: 500}
     );
   }
