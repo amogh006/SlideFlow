@@ -5,42 +5,46 @@ export const dynamic = 'force-dynamic'; // defaults to auto
 export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData();
-    const file = formData.get('file') as File | null;
-
-    if (!file) {
+    
+    // Simple validation
+    if (!formData.has('file')) {
       return NextResponse.json({detail: 'No file uploaded.'}, {status: 400});
     }
 
     const backendUrl = 'http://147.93.102.137:8000/convert-ppt/';
-
+    
     const backendResponse = await fetch(backendUrl, {
       method: 'POST',
       body: formData,
     });
 
+    const responseBody = await backendResponse.text();
+
     if (!backendResponse.ok) {
-      let errorDetail = `Backend returned status ${backendResponse.status}`;
+      let errorDetail = `Backend error: Status ${backendResponse.status}`;
+      // Try to parse the error as JSON, otherwise use the raw text
       try {
-        // Try to parse the error response from the backend
-        const errorJson = await backendResponse.json();
-        errorDetail = errorJson.detail || JSON.stringify(errorJson);
+        const errorJson = JSON.parse(responseBody);
+        errorDetail = errorJson.detail || responseBody;
       } catch (e) {
-        // If parsing fails, use the raw text as detail
-        errorDetail = await backendResponse.text();
+        errorDetail = responseBody;
       }
-       return NextResponse.json({ detail: errorDetail }, { status: backendResponse.status });
+      return NextResponse.json({ detail: errorDetail }, { status: backendResponse.status });
+    }
+    
+    // The request was successful, so we expect JSON.
+    try {
+        const data = JSON.parse(responseBody);
+        return NextResponse.json(data);
+    } catch(e) {
+        return NextResponse.json({ detail: "Backend returned invalid JSON." }, { status: 502 }); // 502 Bad Gateway
     }
 
-    const data = await backendResponse.json();
-    return NextResponse.json(data);
-  } catch (error) {
+  } catch (error: any) {
     console.error('Proxy error in /api/convert:', error);
-    let errorMessage = 'An unknown error occurred in the proxy.';
-    if (error instanceof Error) {
-      errorMessage = error.message;
-    }
+    // This catches network errors (e.g., server unreachable) and other exceptions
     return NextResponse.json(
-      {detail: `Proxy error: ${errorMessage}`},
+      {detail: `Proxy error: ${error.message || 'Unable to connect to backend service.'}`},
       {status: 500}
     );
   }
