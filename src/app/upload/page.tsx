@@ -6,7 +6,15 @@ import Image from 'next/image';
 import { useAppContext } from '@/context/AppContext';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
-import { UploadCloud, X, Presentation, LogOut, Loader2, KeyRound } from 'lucide-react';
+import {
+  UploadCloud,
+  X,
+  Presentation,
+  LogOut,
+  Loader2,
+  KeyRound,
+  TestTube,
+} from 'lucide-react';
 import Link from 'next/link';
 import { useToast } from '@/hooks/use-toast';
 import { Input } from '@/components/ui/input';
@@ -38,22 +46,24 @@ export default function UploadPage() {
 
   const generateScript = async (slidesResponse: any, title: string) => {
     const scriptFormData = new FormData();
-    const blob = new Blob([JSON.stringify(slidesResponse)], { type: 'application/json' });
+    const blob = new Blob([JSON.stringify(slidesResponse)], {
+      type: 'application/json',
+    });
     scriptFormData.append('file', blob, 'slides_response.json');
     scriptFormData.append('presentation_title', title);
     scriptFormData.append('openai_api_key', apiKey);
-  
+
     try {
       const response = await fetch('/api/generate-script', {
         method: 'POST',
         body: scriptFormData,
       });
-  
+
       if (!response.ok) {
         const errorData = await response.json();
         throw new Error(errorData.detail || 'Failed to generate script.');
       }
-  
+
       const scriptData = await response.json();
       setPresentationScript(scriptData);
       toast({
@@ -61,15 +71,15 @@ export default function UploadPage() {
         description: 'Your presentation script is ready.',
       });
     } catch (error) {
-       console.error('Error generating script:', error);
-       toast({
-         title: 'Script Generation Failed',
-         description:
-           error instanceof Error
-             ? error.message
-             : 'An unknown error occurred.',
-         variant: 'destructive',
-       });
+      console.error('Error generating script:', error);
+      toast({
+        title: 'Script Generation Failed',
+        description:
+          error instanceof Error
+            ? error.message
+            : 'An unknown error occurred.',
+        variant: 'destructive',
+      });
     }
   };
 
@@ -184,10 +194,18 @@ export default function UploadPage() {
           <Presentation className="h-6 w-6 text-primary" />
           <span className="text-lg font-semibold">SlideFlow</span>
         </Link>
-        <Button variant="ghost" size="icon" onClick={handleLogout}>
-          <LogOut className="h-5 w-5" />
-          <span className="sr-only">Logout</span>
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button asChild variant="outline" size="sm">
+            <Link href="/websocket-test">
+              <TestTube className="mr-2 h-4 w-4" />
+              WebSocket Test
+            </Link>
+          </Button>
+          <Button variant="ghost" size="icon" onClick={handleLogout}>
+            <LogOut className="h-5 w-5" />
+            <span className="sr-only">Logout</span>
+          </Button>
+        </div>
       </header>
       <main className="flex-1 p-4 md:p-8 lg:p-12">
         <div className="max-w-6xl mx-auto">
@@ -219,7 +237,6 @@ export default function UploadPage() {
             </div>
           </Card>
 
-
           {!file ? (
             <div
               className={`w-full border-2 border-dashed rounded-lg p-12 flex flex-col items-center justify-center text-center transition-colors bg-card/30 ${
@@ -227,7 +244,9 @@ export default function UploadPage() {
                   ? 'cursor-not-allowed'
                   : 'cursor-pointer hover:border-primary'
               }`}
-              onClick={() => !(isLoading || !apiKey) && fileInputRef.current?.click()}
+              onClick={() =>
+                !(isLoading || !apiKey) && fileInputRef.current?.click()
+              }
               onDragOver={handleDragOver}
               onDrop={isLoading || !apiKey ? undefined : handleDrop}
             >
@@ -248,8 +267,14 @@ export default function UploadPage() {
                     Drag & drop your file here
                   </p>
                   <p className="text-muted-foreground mb-4">or</p>
-                  <Button type="button" disabled={!apiKey}>Browse Files</Button>
-                  {!apiKey && <p className="text-sm text-destructive mt-4">Please enter your OpenAI API key to upload.</p>}
+                  <Button type="button" disabled={!apiKey}>
+                    Browse Files
+                  </Button>
+                  {!apiKey && (
+                    <p className="text-sm text-destructive mt-4">
+                      Please enter your OpenAI API key to upload.
+                    </p>
+                  )}
                 </>
               )}
               <input
