@@ -6,14 +6,25 @@ import Image from 'next/image';
 import { useAppContext } from '@/context/AppContext';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
-import { UploadCloud, X, Presentation, LogOut } from 'lucide-react';
+import { UploadCloud, X, Presentation, LogOut, Loader2 } from 'lucide-react';
 import { PlaceHolderImages } from '@/lib/placeholder-images';
 import Link from 'next/link';
+import { useToast } from '@/hooks/use-toast';
 
 export default function UploadPage() {
-  const { isAuthenticated, logout, file, setFile, setSlides } = useAppContext();
+  const {
+    isAuthenticated,
+    logout,
+    file,
+    setFile,
+    setSlides,
+    slides,
+    isLoading,
+    setIsLoading,
+  } = useAppContext();
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const { toast } = useToast();
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -21,11 +32,48 @@ export default function UploadPage() {
     }
   }, [isAuthenticated, router]);
 
-  const processFile = (selectedFile: File) => {
+  const processFile = async (selectedFile: File) => {
     setFile(selectedFile);
-    // Mock slide generation
-    const mockSlides = PlaceHolderImages.map((p) => p.imageUrl);
-    setSlides(mockSlides);
+    setIsLoading(true);
+
+    const formData = new FormData();
+    formData.append('file', selectedFile);
+
+    try {
+      const response = await fetch('http://localhost:8000/convert-ppt/', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.detail || 'Failed to convert presentation.');
+      }
+
+      const data = await response.json();
+
+      if (data.status === 'success' && data.slides) {
+        const imageUrls = data.slides.map(
+          (slide: { image_data: string; content_type: string }) =>
+            `data:${slide.content_type};base64,${slide.image_data}`
+        );
+        setSlides(imageUrls);
+      } else {
+        throw new Error('Invalid response from server.');
+      }
+    } catch (error) {
+      console.error('Error processing file:', error);
+      toast({
+        title: 'Processing Failed',
+        description:
+          error instanceof Error ? error.message : 'An unknown error occurred.',
+        variant: 'destructive',
+      });
+      setFile(null);
+      setSlides([]);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -49,6 +97,12 @@ export default function UploadPage() {
         droppedFile.name.endsWith('.pptx'))
     ) {
       processFile(droppedFile);
+    } else {
+      toast({
+        title: 'Invalid File Type',
+        description: 'Please drop a .ppt or .pptx file.',
+        variant: 'destructive',
+      });
     }
   };
 
@@ -91,23 +145,42 @@ export default function UploadPage() {
 
           {!file ? (
             <div
-              className="w-full border-2 border-dashed border-muted-foreground/50 rounded-lg p-12 flex flex-col items-center justify-center text-center cursor-pointer hover:border-primary transition-colors bg-card/30"
-              onClick={() => fileInputRef.current?.click()}
+              className={`w-full border-2 border-dashed rounded-lg p-12 flex flex-col items-center justify-center text-center transition-colors bg-card/30 ${
+                isLoading
+                  ? 'cursor-not-allowed'
+                  : 'cursor-pointer hover:border-primary'
+              }`}
+              onClick={() => !isLoading && fileInputRef.current?.click()}
               onDragOver={handleDragOver}
-              onDrop={handleDrop}
+              onDrop={isLoading ? undefined : handleDrop}
             >
-              <UploadCloud className="h-12 w-12 text-muted-foreground mb-4" />
-              <p className="text-lg font-semibold mb-2">
-                Drag & drop your file here
-              </p>
-              <p className="text-muted-foreground mb-4">or</p>
-              <Button type="button">Browse Files</Button>
+              {isLoading ? (
+                <>
+                  <Loader2 className="h-12 w-12 text-primary animate-spin mb-4" />
+                  <p className="text-lg font-semibold mb-2">
+                    Processing your presentation...
+                  </p>
+                  <p className="text-muted-foreground">
+                    This may take a moment.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <UploadCloud className="h-12 w-12 text-muted-foreground mb-4" />
+                  <p className="text-lg font-semibold mb-2">
+                    Drag & drop your file here
+                  </p>
+                  <p className="text-muted-foreground mb-4">or</p>
+                  <Button type="button">Browse Files</Button>
+                </>
+              )}
               <input
                 ref={fileInputRef}
                 type="file"
                 className="hidden"
                 onChange={handleFileChange}
                 accept=".ppt,.pptx,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                disabled={isLoading}
               />
             </div>
           ) : (
@@ -140,18 +213,17 @@ export default function UploadPage() {
 
               <h2 className="text-2xl font-bold mb-4">Slide Preview</h2>
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-                {PlaceHolderImages.map((slide, index) => (
+                {slides.map((slideUrl, index) => (
                   <Card
-                    key={slide.id}
+                    key={index}
                     className="overflow-hidden group shadow-lg"
                   >
                     <div className="aspect-[4/3] relative">
                       <Image
-                        src={slide.imageUrl}
+                        src={slideUrl}
                         alt={`Slide ${index + 1}`}
                         fill
                         className="object-cover transition-transform group-hover:scale-105"
-                        data-ai-hint={slide.imageHint}
                       />
                       <div className="absolute bottom-2 right-2 bg-black/50 text-white text-xs px-2 py-1 rounded-md">
                         Slide {index + 1}

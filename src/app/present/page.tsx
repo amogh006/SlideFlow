@@ -20,6 +20,7 @@ export default function PresentPage() {
   const { isAuthenticated, slides } = useAppContext();
   const router = useRouter();
   const [isFullScreen, setIsFullScreen] = useState(false);
+  const carouselContainerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!isAuthenticated || slides.length === 0) {
@@ -43,6 +44,15 @@ export default function PresentPage() {
     };
     window.addEventListener('keydown', handleKeyDown);
 
+    // Auto-enter fullscreen on mount
+    if (carouselContainerRef.current) {
+        carouselContainerRef.current.requestFullscreen().catch((err) => {
+        console.error(
+          `Error attempting to enable full-screen mode: ${err.message} (${err.name})`
+        );
+      });
+    }
+
     return () => {
       document.removeEventListener('fullscreenchange', handleFullScreenChange);
       window.removeEventListener('keydown', handleKeyDown);
@@ -50,8 +60,11 @@ export default function PresentPage() {
   }, []);
 
   const toggleFullScreen = () => {
+    const element = carouselContainerRef.current;
+    if (!element) return;
+
     if (!document.fullscreenElement) {
-      document.documentElement.requestFullscreen().catch((err) => {
+      element.requestFullscreen().catch((err) => {
         console.error(
           `Error attempting to enable full-screen mode: ${err.message} (${err.name})`
         );
@@ -66,23 +79,22 @@ export default function PresentPage() {
   }
 
   return (
-    <div className="bg-gray-900 text-white w-full h-screen flex flex-col items-center justify-center relative group">
-      <Carousel className="w-full max-w-7xl" opts={{ loop: true }}>
-        <CarouselContent>
+    <div
+      ref={carouselContainerRef}
+      className="bg-gray-900 text-white w-full h-screen flex flex-col items-center justify-center relative group"
+    >
+      <Carousel className="w-full h-full" opts={{ loop: true }}>
+        <CarouselContent className="h-full">
           {slides.map((slideUrl, index) => (
-            <CarouselItem key={index}>
-              <div className="p-1">
-                <Card className="bg-transparent border-none">
-                  <CardContent className="flex aspect-video items-center justify-center p-0 overflow-hidden">
-                    <Image
-                      src={slideUrl}
-                      alt={`Slide ${index + 1}`}
-                      width={1920}
-                      height={1080}
-                      className="w-full h-full object-contain"
-                    />
-                  </CardContent>
-                </Card>
+            <CarouselItem key={index} className="h-full">
+              <div className="w-full h-full p-12 flex items-center justify-center">
+                <Image
+                  src={slideUrl}
+                  alt={`Slide ${index + 1}`}
+                  width={1920}
+                  height={1080}
+                  className="w-auto h-auto max-w-full max-h-full object-contain"
+                />
               </div>
             </CarouselItem>
           ))}
