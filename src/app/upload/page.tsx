@@ -40,7 +40,7 @@ export default function UploadPage() {
     formData.append('file', selectedFile);
 
     try {
-      const response = await fetch('http://localhost:8000/convert-ppt/', {
+      const response = await fetch('http://147.93.102.137:8000/convert-ppt/', {
         method: 'POST',
         body: formData,
       });
