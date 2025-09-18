@@ -19,14 +19,16 @@ export async function POST(request: NextRequest) {
     });
 
     if (!backendResponse.ok) {
-      const errorText = await backendResponse.text();
-      // Try to parse as JSON, but fallback to text if it fails
+      let errorDetail = `Backend returned status ${backendResponse.status}`;
       try {
-        const errorJson = JSON.parse(errorText);
-        return NextResponse.json(errorJson, {status: backendResponse.status});
+        // Try to parse the error response from the backend
+        const errorJson = await backendResponse.json();
+        errorDetail = errorJson.detail || JSON.stringify(errorJson);
       } catch (e) {
-        return new NextResponse(errorText, {status: backendResponse.status, headers: {'Content-Type': 'application/json'}});
+        // If parsing fails, use the raw text as detail
+        errorDetail = await backendResponse.text();
       }
+       return NextResponse.json({ detail: errorDetail }, { status: backendResponse.status });
     }
 
     const data = await backendResponse.json();
