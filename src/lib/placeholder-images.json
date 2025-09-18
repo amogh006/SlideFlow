@@ -1,3 +1,28 @@
 {
-  "placeholderImages": []
+  "placeholderImages": [
+    {
+      "id": "slide1",
+      "description": "A placeholder for the first slide of a presentation.",
+      "imageUrl": "https://picsum.photos/seed/slide1/800/600",
+      "imageHint": "presentation title"
+    },
+    {
+      "id": "slide2",
+      "description": "A placeholder for the second slide of a presentation.",
+      "imageUrl": "https://picsum.photos/seed/slide2/800/600",
+      "imageHint": "chart graph"
+    },
+    {
+      "id": "slide3",
+      "description": "A placeholder for the third slide of a presentation.",
+      "imageUrl": "https://picsum.photos/seed/slide3/800/600",
+      "imageHint": "bullet points"
+    },
+    {
+      "id": "slide4",
+      "description": "A placeholder for the fourth slide of a presentation.",
+      "imageUrl": "https://picsum.photos/seed/slide4/800/600",
+      "imageHint": "team members"
+    }
+  ]
 }
