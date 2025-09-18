@@ -44,15 +44,6 @@ export default function PresentPage() {
     };
     window.addEventListener('keydown', handleKeyDown);
 
-    // Auto-enter fullscreen on mount
-    if (carouselContainerRef.current) {
-        carouselContainerRef.current.requestFullscreen().catch((err) => {
-        console.error(
-          `Error attempting to enable full-screen mode: ${err.message} (${err.name})`
-        );
-      });
-    }
-
     return () => {
       document.removeEventListener('fullscreenchange', handleFullScreenChange);
       window.removeEventListener('keydown', handleKeyDown);
