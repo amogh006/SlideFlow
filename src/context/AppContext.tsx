@@ -32,8 +32,6 @@ interface AppContextType {
   setFile: (file: File | null) => void;
   slides: string[];
   setSlides: (slides: string[]) => void;
-  isLoading: boolean;
-  setIsLoading: (isLoading: boolean) => void;
   presentationScript: PresentationScript | null;
   setPresentationScript: (script: PresentationScript | null) => void;
   apiKey: string;
@@ -46,7 +44,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [file, setFile] = useState<File | null>(null);
   const [slides, setSlides] = useState<string[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
   const [presentationScript, setPresentationScript] = useState<PresentationScript | null>(null);
   const [apiKey, setApiKey] = useState('');
 
@@ -56,7 +53,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setIsAuthenticated(false);
     setFile(null);
     setSlides([]);
-    setIsLoading(false);
     setPresentationScript(null);
   };
 
@@ -70,8 +66,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
         setFile,
         slides,
         setSlides,
-        isLoading,
-        setIsLoading,
         presentationScript,
         setPresentationScript,
         apiKey,

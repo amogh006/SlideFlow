@@ -31,8 +31,6 @@ export default function UploadPage() {
     setFile,
     setSlides,
     slides,
-    isLoading,
-    setIsLoading,
     setPresentationScript,
     apiKey,
     setApiKey,
@@ -128,7 +126,6 @@ export default function UploadPage() {
     setLoadingState('converting');
     setLoadingProgress(0);
     setLoadingMessage('Processing your presentation...');
-    setIsLoading(true);
 
     const formData = new FormData();
     formData.append('file', selectedFile);
@@ -170,10 +167,6 @@ export default function UploadPage() {
       });
       setFile(null);
       setSlides([]);
-    } finally {
-      if (loadingState !== 'scripting') {
-         setIsLoading(false);
-      }
     }
   };
 
@@ -286,7 +279,7 @@ export default function UploadPage() {
                   : 'cursor-pointer hover:border-primary'
               }`}
               onClick={() =>
-                !apiKey && fileInputRef.current?.click()
+                apiKey && fileInputRef.current?.click()
               }
               onDragOver={handleDragOver}
               onDrop={!apiKey ? undefined : handleDrop}
