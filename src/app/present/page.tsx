@@ -15,6 +15,7 @@ import {
 } from '@/components/ui/carousel';
 import { Button } from '@/components/ui/button';
 import { Expand, Mic, Shrink, X } from 'lucide-react';
+import { useToast } from '@/hooks/use-toast';
 
 // Helper to decode Base64
 const decodeBase64 = (base64: string) => {
@@ -30,15 +31,19 @@ const decodeBase64 = (base64: string) => {
 export default function PresentPage() {
   const { isAuthenticated, slides, presentationScript } = useAppContext();
   const router = useRouter();
+  const { toast } = useToast();
+
   const [isFullScreen, setIsFullScreen] = useState(false);
   const carouselContainerRef = useRef<HTMLDivElement>(null);
   const [api, setApi] = useState<CarouselApi>();
+
   const ws = useRef<WebSocket | null>(null);
-  const audioQueue = useRef<AudioBuffer[]>([]);
   const audioContext = useRef<AudioContext | null>(null);
+  const audioQueue = useRef<AudioBuffer[]>([]);
   const isPlaying = useRef(false);
+
   const [currentCaption, setCurrentCaption] = useState('');
-  const [currentSlideIndex, setCurrentSlideIndex] = useState(0);
+  const [currentSlideIndex, setCurrentSlideIndex] = useState(-1);
 
   useEffect(() => {
     if (!isAuthenticated || slides.length === 0 || !presentationScript) {
@@ -54,14 +59,15 @@ export default function PresentPage() {
 
     if (!audioContext.current) {
       try {
-        audioContext.current = new (window.AudioContext || window.webkitAudioContext)();
+        audioContext.current = new (window.AudioContext ||
+          window.webkitAudioContext)();
       } catch (e) {
-        console.error("Web Audio API is not supported in this browser", e);
+        console.error('Web Audio API is not supported in this browser', e);
         isPlaying.current = false;
         return;
       }
     }
-    
+
     await audioContext.current.resume();
     const audioBuffer = audioQueue.current.shift()!;
     const source = audioContext.current.createBufferSource();
@@ -77,12 +83,12 @@ export default function PresentPage() {
   useEffect(() => {
     if (!presentationScript || ws.current) return;
 
-    ws.current = new WebSocket('ws://147.93.102.137:8000/ws/presentation');
+    const newWs = new WebSocket('ws://147.93.102.137:8000/ws/presentation');
+    ws.current = newWs;
 
-    ws.current.onopen = () => {
+    newWs.onopen = () => {
       console.log('WebSocket connected');
-      // Load presentation into WebSocket session
-      ws.current?.send(
+      newWs.send(
         JSON.stringify({
           type: 'load_presentation',
           data: presentationScript,
@@ -90,7 +96,7 @@ export default function PresentPage() {
       );
     };
 
-    ws.current.onmessage = async (event) => {
+    newWs.onmessage = async (event) => {
       const message = JSON.parse(event.data);
 
       switch (message.type) {
@@ -99,83 +105,101 @@ export default function PresentPage() {
           break;
         case 'presentation_loaded':
           console.log(message.message);
-          // Automatically start the first slide
-          if (api) {
-             api.scrollTo(0);
+          // Now that presentation is loaded, start the first slide
+          if (api && currentSlideIndex === 0) {
+            newWs.send(JSON.stringify({ type: 'slide_start', slide_number: 1 }));
           }
           break;
         case 'audio_chunk':
           try {
             const audioData = decodeBase64(message.audio_data);
-             if (audioContext.current) {
-                const audioBuffer = await audioContext.current.decodeAudioData(audioData);
-                audioQueue.current.push(audioBuffer);
-                playNextAudioChunk();
+            if (audioContext.current) {
+              const audioBuffer =
+                await audioContext.current.decodeAudioData(audioData);
+              audioQueue.current.push(audioBuffer);
+              playNextAudioChunk();
             }
           } catch (e) {
-            console.error("Error decoding audio data:", e);
+            console.error('Error decoding audio data:', e);
           }
           break;
         case 'slide_started':
-          setCurrentCaption(presentationScript.slides[message.slide_number - 1].script);
+          setCurrentCaption(
+            presentationScript.slides[message.slide_number - 1].script
+          );
           break;
         case 'slide_done':
-           setCurrentCaption('');
-           break;
+          setCurrentCaption('');
+          break;
         case 'qa_response':
-            setCurrentCaption(`Q: ${message.question}\nA: ${message.answer}`);
-            try {
-              const audioData = decodeBase64(message.audio_data);
-               if (audioContext.current) {
-                  const audioBuffer = await audioContext.current.decodeAudioData(audioData);
-                  audioQueue.current.push(audioBuffer);
-                  playNextAudioChunk();
-              }
-            } catch (e) {
-              console.error("Error decoding audio data:", e);
+          setCurrentCaption(`Q: ${message.question}\nA: ${message.answer}`);
+          try {
+            const audioData = decodeBase64(message.audio_data);
+            if (audioContext.current) {
+              const audioBuffer =
+                await audioContext.current.decodeAudioData(audioData);
+              audioQueue.current.push(audioBuffer);
+              playNextAudioChunk();
             }
-            break;
+          } catch (e) {
+            console.error('Error decoding audio data:', e);
+          }
+          break;
         case 'error':
           console.error(`WebSocket Error: ${message.message}`);
+          toast({
+            title: 'Presentation Error',
+            description: message.message,
+            variant: 'destructive',
+          });
           break;
       }
     };
 
-    ws.current.onclose = () => {
+    newWs.onclose = () => {
       console.log('WebSocket disconnected');
     };
 
-    ws.current.onerror = (error) => {
+    newWs.onerror = (error) => {
       console.error('WebSocket error:', error);
     };
 
     return () => {
-      ws.current?.close();
+      newWs?.close();
+      ws.current = null;
     };
-  }, [presentationScript, api]);
-
+  }, [presentationScript, api, toast, currentSlideIndex]);
+  
   useEffect(() => {
     if (!api) {
       return;
     }
- 
+  
     const handleSelect = () => {
-        const newSlideIndex = api.selectedScrollSnap();
-        if (ws.current && ws.current.readyState === WebSocket.OPEN && newSlideIndex !== currentSlideIndex) {
-            setCurrentSlideIndex(newSlideIndex);
-            audioQueue.current = []; // Clear queue for new slide
-            isPlaying.current = false;
-            if(audioContext.current?.state === 'running') {
-                audioContext.current.suspend();
-            }
-            ws.current.send(JSON.stringify({ type: 'slide_start', slide_number: newSlideIndex + 1 }));
+      const newSlideIndex = api.selectedScrollSnap();
+      if (newSlideIndex === currentSlideIndex) return;
+
+      setCurrentSlideIndex(newSlideIndex);
+
+      if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+        // Clear audio queue and stop current playback for new slide
+        audioQueue.current = [];
+        isPlaying.current = false;
+        if(audioContext.current?.state === 'running') {
+            audioContext.current.suspend().then(() => audioContext.current?.close());
+            audioContext.current = null;
         }
+
+        ws.current.send(JSON.stringify({ type: 'slide_start', slide_number: newSlideIndex + 1 }));
+      }
     }
+    
     api.on('select', handleSelect);
-
-    // Start first slide
-    handleSelect();
-
+    // Set initial slide after API is ready
+    if(currentSlideIndex === -1){
+        setCurrentSlideIndex(0);
+    }
+  
     return () => {
       api.off('select', handleSelect);
     };

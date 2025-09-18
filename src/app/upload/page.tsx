@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Image from 'next/image';
 import { useAppContext } from '@/context/AppContext';
@@ -19,6 +19,9 @@ import Link from 'next/link';
 import { useToast } from '@/hooks/use-toast';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Progress } from '@/components/ui/progress';
+
+type LoadingState = 'idle' | 'converting' | 'scripting' | 'done' | 'error';
 
 export default function UploadPage() {
   const {
@@ -33,18 +36,39 @@ export default function UploadPage() {
     setPresentationScript,
     apiKey,
     setApiKey,
+    presentationScript,
   } = useAppContext();
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { toast } = useToast();
+  const [loadingState, setLoadingState] = useState<LoadingState>('idle');
+  const [loadingProgress, setLoadingProgress] = useState(0);
+  const [loadingMessage, setLoadingMessage] = useState('');
 
   useEffect(() => {
     if (!isAuthenticated) {
       router.push('/');
     }
   }, [isAuthenticated, router]);
+  
+  useEffect(() => {
+    if(file && presentationScript) {
+        setLoadingState('done');
+    } else if (file && slides.length > 0 && !presentationScript) {
+        setLoadingState('scripting');
+    } else if (file && slides.length === 0) {
+        setLoadingState('converting');
+    } else {
+        setLoadingState('idle');
+    }
+  }, [file, slides, presentationScript]);
+
 
   const generateScript = async (slidesResponse: any, title: string) => {
+    setLoadingState('scripting');
+    setLoadingProgress(50);
+    setLoadingMessage('Generating presentation script...');
+
     const scriptFormData = new FormData();
     const blob = new Blob([JSON.stringify(slidesResponse)], {
       type: 'application/json',
@@ -66,12 +90,17 @@ export default function UploadPage() {
 
       const scriptData = await response.json();
       setPresentationScript(scriptData);
+      setLoadingProgress(100);
+      setLoadingMessage('Script generated successfully!');
+      setLoadingState('done');
       toast({
         title: 'Script Generated',
         description: 'Your presentation script is ready.',
       });
     } catch (error) {
       console.error('Error generating script:', error);
+      setLoadingState('error');
+      setLoadingMessage('Script generation failed.');
       toast({
         title: 'Script Generation Failed',
         description:
@@ -94,9 +123,12 @@ export default function UploadPage() {
     }
 
     setFile(selectedFile);
-    setIsLoading(true);
     setSlides([]);
     setPresentationScript(null);
+    setLoadingState('converting');
+    setLoadingProgress(0);
+    setLoadingMessage('Processing your presentation...');
+    setIsLoading(true);
 
     const formData = new FormData();
     formData.append('file', selectedFile);
@@ -120,12 +152,16 @@ export default function UploadPage() {
             `data:${slide.content_type};base64,${slide.image_data}`
         );
         setSlides(imageUrls);
+        setLoadingProgress(25);
+        setLoadingMessage('Presentation processed, generating script...');
         await generateScript(data, selectedFile.name);
       } else {
         throw new Error('Invalid response from server.');
       }
     } catch (error) {
       console.error('Error processing file:', error);
+      setLoadingState('error');
+      setLoadingMessage('File processing failed.');
       toast({
         title: 'Processing Failed',
         description:
@@ -135,7 +171,9 @@ export default function UploadPage() {
       setFile(null);
       setSlides([]);
     } finally {
-      setIsLoading(false);
+      if (loadingState !== 'scripting') {
+         setIsLoading(false);
+      }
     }
   };
 
@@ -173,6 +211,9 @@ export default function UploadPage() {
     setFile(null);
     setSlides([]);
     setPresentationScript(null);
+    setLoadingState('idle');
+    setLoadingProgress(0);
+    setLoadingMessage('');
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -237,45 +278,31 @@ export default function UploadPage() {
             </div>
           </Card>
 
-          {!file ? (
+          {loadingState === 'idle' ? (
             <div
               className={`w-full border-2 border-dashed rounded-lg p-12 flex flex-col items-center justify-center text-center transition-colors bg-card/30 ${
-                isLoading || !apiKey
+                !apiKey
                   ? 'cursor-not-allowed'
                   : 'cursor-pointer hover:border-primary'
               }`}
               onClick={() =>
-                !(isLoading || !apiKey) && fileInputRef.current?.click()
+                !apiKey && fileInputRef.current?.click()
               }
               onDragOver={handleDragOver}
-              onDrop={isLoading || !apiKey ? undefined : handleDrop}
+              onDrop={!apiKey ? undefined : handleDrop}
             >
-              {isLoading ? (
-                <>
-                  <Loader2 className="h-12 w-12 text-primary animate-spin mb-4" />
-                  <p className="text-lg font-semibold mb-2">
-                    Processing your presentation...
-                  </p>
-                  <p className="text-muted-foreground">
-                    This may take a moment. Generating script...
-                  </p>
-                </>
-              ) : (
-                <>
-                  <UploadCloud className="h-12 w-12 text-muted-foreground mb-4" />
-                  <p className="text-lg font-semibold mb-2">
-                    Drag & drop your file here
-                  </p>
-                  <p className="text-muted-foreground mb-4">or</p>
-                  <Button type="button" disabled={!apiKey}>
-                    Browse Files
-                  </Button>
-                  {!apiKey && (
-                    <p className="text-sm text-destructive mt-4">
-                      Please enter your OpenAI API key to upload.
-                    </p>
-                  )}
-                </>
+              <UploadCloud className="h-12 w-12 text-muted-foreground mb-4" />
+              <p className="text-lg font-semibold mb-2">
+                Drag & drop your file here
+              </p>
+              <p className="text-muted-foreground mb-4">or</p>
+              <Button type="button" disabled={!apiKey} onClick={() => fileInputRef.current?.click()}>
+                Browse Files
+              </Button>
+              {!apiKey && (
+                <p className="text-sm text-destructive mt-4">
+                  Please enter your OpenAI API key to upload.
+                </p>
               )}
               <input
                 ref={fileInputRef}
@@ -283,8 +310,21 @@ export default function UploadPage() {
                 className="hidden"
                 onChange={handleFileChange}
                 accept=".ppt,.pptx,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                disabled={isLoading || !apiKey}
+                disabled={!apiKey}
               />
+            </div>
+          ) : loadingState === 'converting' || loadingState === 'scripting' ? (
+             <div
+              className={`w-full border-2 border-dashed rounded-lg p-12 flex flex-col items-center justify-center text-center transition-colors bg-card/30 cursor-not-allowed`}
+            >
+                  <Loader2 className="h-12 w-12 text-primary animate-spin mb-4" />
+                  <p className="text-lg font-semibold mb-2">
+                    {loadingMessage}
+                  </p>
+                  <Progress value={loadingProgress} className="w-full max-w-sm mt-4" />
+                   <p className="text-muted-foreground mt-2">
+                    Please keep this window open.
+                  </p>
             </div>
           ) : (
             <div>
@@ -293,14 +333,14 @@ export default function UploadPage() {
                   <div className="flex items-center gap-4">
                     <Presentation className="h-8 w-8 text-primary" />
                     <div>
-                      <p className="font-semibold">{file.name}</p>
+                      <p className="font-semibold">{file?.name}</p>
                       <p className="text-sm text-muted-foreground">
-                        {(file.size / 1024 / 1024).toFixed(2)} MB
+                        {file && (file.size / 1024 / 1024).toFixed(2)} MB
                       </p>
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
-                    <Button asChild>
+                    <Button asChild disabled={loadingState !== 'done'}>
                       <Link href="/present">Present</Link>
                     </Button>
                     <Button

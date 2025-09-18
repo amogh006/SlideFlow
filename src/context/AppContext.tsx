@@ -56,6 +56,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setIsAuthenticated(false);
     setFile(null);
     setSlides([]);
+    setIsLoading(false);
     setPresentationScript(null);
   };
 
