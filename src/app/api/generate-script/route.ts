@@ -37,10 +37,14 @@ export async function POST(request: NextRequest) {
 
   } catch (error: any) {
     console.error('Proxy error in /api/generate-script:', error);
-    // This catches network errors (e.g., server unreachable) and other exceptions
+     // This catches network errors (e.g., server unreachable) and other exceptions
+    const detail = error.cause?.code === 'ECONNREFUSED' 
+        ? 'Connection refused. The backend service at http://147.93.102.137:8000 might be down.'
+        : `Proxy error: ${error.message || 'Unable to connect to backend service.'}`;
+
     return NextResponse.json(
-      {detail: `Proxy error: ${error.message || 'Unable to connect to backend service.'}`},
-      {status: 500}
+      {detail},
+      {status: 502} // 502 Bad Gateway is appropriate for proxy errors
     );
   }
 }
