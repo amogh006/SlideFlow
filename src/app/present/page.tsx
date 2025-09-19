@@ -16,9 +16,11 @@ import {
 import { Button } from '@/components/ui/button';
 import { Expand, Mic, Shrink, X } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
+import { Progress } from '@/components/ui/progress';
 
 // Helper to decode Base64
 const decodeBase64 = (base64: string) => {
+  if (typeof window === 'undefined') return new ArrayBuffer(0);
   const binaryString = window.atob(base64);
   const len = binaryString.length;
   const bytes = new Uint8Array(len);
@@ -41,9 +43,15 @@ export default function PresentPage() {
   const audioContext = useRef<AudioContext | null>(null);
   const audioQueue = useRef<AudioBuffer[]>([]);
   const isPlaying = useRef(false);
-
+  const sourceNode = useRef<AudioBufferSourceNode | null>(null);
+  
   const [currentCaption, setCurrentCaption] = useState('');
   const [currentSlideIndex, setCurrentSlideIndex] = useState(-1);
+
+  const [audioProgress, setAudioProgress] = useState(0);
+  const totalAudioDuration = useRef(0);
+  const playbackStartTime = useRef(0);
+  const progressInterval = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     if (!isAuthenticated || slides.length === 0 || !presentationScript) {
@@ -51,13 +59,31 @@ export default function PresentPage() {
     }
   }, [isAuthenticated, slides, presentationScript, router]);
 
+   const stopAudio = () => {
+    if (progressInterval.current) {
+      clearInterval(progressInterval.current);
+      progressInterval.current = null;
+    }
+    if (sourceNode.current) {
+      sourceNode.current.onended = null;
+      sourceNode.current.stop();
+      sourceNode.current = null;
+    }
+    audioQueue.current = [];
+    isPlaying.current = false;
+    setAudioProgress(0);
+    totalAudioDuration.current = 0;
+    playbackStartTime.current = 0;
+  };
+
+
   const playNextAudioChunk = async () => {
     if (isPlaying.current || audioQueue.current.length === 0) {
       return;
     }
     isPlaying.current = true;
 
-    if (!audioContext.current) {
+    if (!audioContext.current || audioContext.current.state === 'closed') {
       try {
         audioContext.current = new (window.AudioContext ||
           window.webkitAudioContext)();
@@ -67,18 +93,49 @@ export default function PresentPage() {
         return;
       }
     }
-
+    
     await audioContext.current.resume();
-    const audioBuffer = audioQueue.current.shift()!;
+    
+    // Concatenate all buffers in the queue
+    const totalLength = audioQueue.current.reduce((acc, buffer) => acc + buffer.length, 0);
+    const outputBuffer = audioContext.current.createBuffer(
+        1,
+        totalLength,
+        audioContext.current.sampleRate
+    );
+    const outputData = outputBuffer.getChannelData(0);
+
+    let offset = 0;
+    for (const buffer of audioQueue.current) {
+        outputData.set(buffer.getChannelData(0), offset);
+        offset += buffer.length;
+    }
+    audioQueue.current = [];
+
+    totalAudioDuration.current = outputBuffer.duration;
+    
     const source = audioContext.current.createBufferSource();
-    source.buffer = audioBuffer;
+    source.buffer = outputBuffer;
     source.connect(audioContext.current.destination);
+    
     source.onended = () => {
-      isPlaying.current = false;
-      playNextAudioChunk();
+      stopAudio();
     };
+
     source.start();
+    sourceNode.current = source;
+    playbackStartTime.current = audioContext.current.currentTime;
+
+    if (progressInterval.current) clearInterval(progressInterval.current);
+    progressInterval.current = setInterval(() => {
+      if (audioContext.current && isPlaying.current) {
+        const elapsedTime = audioContext.current.currentTime - playbackStartTime.current;
+        const progress = (elapsedTime / totalAudioDuration.current) * 100;
+        setAudioProgress(Math.min(progress, 100));
+      }
+    }, 100);
   };
+
 
   useEffect(() => {
     if (!presentationScript || ws.current) return;
@@ -106,18 +163,19 @@ export default function PresentPage() {
         case 'presentation_loaded':
           console.log(message.message);
           // Now that presentation is loaded, start the first slide
-          if (api && currentSlideIndex === 0) {
+          if (currentSlideIndex === 0) {
             newWs.send(JSON.stringify({ type: 'slide_start', slide_number: 1 }));
           }
           break;
         case 'audio_chunk':
           try {
             const audioData = decodeBase64(message.audio_data);
-            if (audioContext.current) {
-              const audioBuffer =
-                await audioContext.current.decodeAudioData(audioData);
+            if (audioContext.current || (typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext))) {
+                if(!audioContext.current || audioContext.current.state === 'closed'){
+                    audioContext.current = new (window.AudioContext || window.webkitAudioContext)();
+                }
+              const audioBuffer = await audioContext.current.decodeAudioData(audioData);
               audioQueue.current.push(audioBuffer);
-              playNextAudioChunk();
             }
           } catch (e) {
             console.error('Error decoding audio data:', e);
@@ -129,15 +187,17 @@ export default function PresentPage() {
           );
           break;
         case 'slide_done':
-          setCurrentCaption('');
+           if (!message.is_qa) {
+             playNextAudioChunk();
+           }
           break;
         case 'qa_response':
           setCurrentCaption(`Q: ${message.question}\nA: ${message.answer}`);
+          stopAudio();
           try {
             const audioData = decodeBase64(message.audio_data);
             if (audioContext.current) {
-              const audioBuffer =
-                await audioContext.current.decodeAudioData(audioData);
+              const audioBuffer = await audioContext.current.decodeAudioData(audioData);
               audioQueue.current.push(audioBuffer);
               playNextAudioChunk();
             }
@@ -167,8 +227,12 @@ export default function PresentPage() {
     return () => {
       newWs?.close();
       ws.current = null;
+      stopAudio();
+      if (audioContext.current) {
+        audioContext.current.close();
+      }
     };
-  }, [presentationScript, api, toast, currentSlideIndex]);
+  }, [presentationScript, toast, currentSlideIndex]);
   
   useEffect(() => {
     if (!api) {
@@ -178,52 +242,54 @@ export default function PresentPage() {
     const handleSelect = () => {
       const newSlideIndex = api.selectedScrollSnap();
       if (newSlideIndex === currentSlideIndex) return;
-
+      
       setCurrentSlideIndex(newSlideIndex);
+      stopAudio();
+      setCurrentCaption('');
 
       if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-        // Clear audio queue and stop current playback for new slide
-        audioQueue.current = [];
-        isPlaying.current = false;
-        if(audioContext.current?.state === 'running') {
-            audioContext.current.suspend().then(() => audioContext.current?.close());
-            audioContext.current = null;
-        }
-
         ws.current.send(JSON.stringify({ type: 'slide_start', slide_number: newSlideIndex + 1 }));
       }
     }
     
     api.on('select', handleSelect);
     // Set initial slide after API is ready
-    if(currentSlideIndex === -1){
+    if(currentSlideIndex === -1 && presentationScript){
         setCurrentSlideIndex(0);
+         if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+             ws.current.send(JSON.stringify({ type: 'slide_start', slide_number: 1 }));
+         }
     }
   
     return () => {
       api.off('select', handleSelect);
     };
-  }, [api, currentSlideIndex]);
+  }, [api, currentSlideIndex, presentationScript]);
 
 
   const handleFullScreenChange = () => {
-    setIsFullScreen(!!document.fullscreenElement);
+    if (typeof document !== 'undefined') {
+      setIsFullScreen(!!document.fullscreenElement);
+    }
   };
 
   const toggleFullScreen = () => {
     const element = carouselContainerRef.current;
     if (!element) return;
 
-    if (!document.fullscreenElement) {
-      element.requestFullscreen().catch((err) => {
-        console.error(`Error attempting to enable full-screen mode: ${err.message} (${err.name})`);
-      });
-    } else {
-      document.exitFullscreen();
+    if (typeof document !== 'undefined') {
+        if (!document.fullscreenElement) {
+          element.requestFullscreen().catch((err) => {
+            console.error(`Error attempting to enable full-screen mode: ${err.message} (${err.name})`);
+          });
+        } else {
+          document.exitFullscreen();
+        }
     }
   };
 
   useEffect(() => {
+    if(typeof document === 'undefined') return;
     document.addEventListener('fullscreenchange', handleFullScreenChange);
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'f') toggleFullScreen();
@@ -242,6 +308,7 @@ export default function PresentPage() {
       const question = "Can you explain this slide in simpler terms?"; // Hardcoded question
       ws.current.send(JSON.stringify({ type: 'interrupt', question }));
       setCurrentCaption(`Asking: "${question}"`);
+      stopAudio();
     }
   };
 
@@ -275,7 +342,14 @@ export default function PresentPage() {
       </Carousel>
 
       <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-black/80 to-transparent">
-        <p className="text-center text-xl whitespace-pre-wrap">{currentCaption}</p>
+        <p className="text-center text-xl whitespace-pre-wrap h-20 overflow-y-auto">{currentCaption}</p>
+      </div>
+
+       <div className="absolute bottom-0 left-0 right-0 w-full h-1 group-hover:h-2 transition-all">
+        <Progress
+          value={audioProgress}
+          className="w-full h-full bg-gray-500/50 [&>div]:bg-red-600 rounded-none"
+        />
       </div>
 
       <div className="absolute top-4 right-4 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -312,3 +386,5 @@ export default function PresentPage() {
     </div>
   );
 }
+
+  
