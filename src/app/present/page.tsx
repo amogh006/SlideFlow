@@ -18,6 +18,16 @@ import { Expand, Mic, Shrink, X } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 import { Progress } from '@/components/ui/progress';
 
+interface DebugInfo {
+  status: string;
+  currentSlide: number;
+  totalChunks: number;
+  chunksReceived: number;
+  lastChunkSize: number;
+  audioPlayerState: 'idle' | 'playing' | 'buffering';
+  currentCaption: string;
+}
+
 // Helper to decode Base64
 const decodeBase64 = (base64: string) => {
   if (typeof window === 'undefined') return new ArrayBuffer(0);
@@ -44,8 +54,7 @@ export default function PresentPage() {
   const audioQueue = useRef<AudioBuffer[]>([]);
   const isPlaying = useRef(false);
   const sourceNode = useRef<AudioBufferSourceNode | null>(null);
-  
-  const [currentCaption, setCurrentCaption] = useState('');
+
   const [currentSlideIndex, setCurrentSlideIndex] = useState(-1);
 
   const [audioProgress, setAudioProgress] = useState(0);
@@ -53,11 +62,25 @@ export default function PresentPage() {
   const playbackStartTime = useRef(0);
   const progressInterval = useRef<NodeJS.Timeout | null>(null);
 
+  const [debugInfo, setDebugInfo] = useState<DebugInfo>({
+    status: 'Disconnected',
+    currentSlide: 0,
+    totalChunks: 0,
+    chunksReceived: 0,
+    lastChunkSize: 0,
+    audioPlayerState: 'idle',
+    currentCaption: '',
+  });
+
   useEffect(() => {
     if (!isAuthenticated || slides.length === 0 || !presentationScript) {
       router.push('/upload');
     }
   }, [isAuthenticated, slides, presentationScript, router]);
+
+  const updateDebug = (newInfo: Partial<DebugInfo>) => {
+    setDebugInfo(prev => ({...prev, ...newInfo}));
+  }
 
    const stopAudio = () => {
     if (progressInterval.current) {
@@ -74,6 +97,7 @@ export default function PresentPage() {
     setAudioProgress(0);
     totalAudioDuration.current = 0;
     playbackStartTime.current = 0;
+    updateDebug({ audioPlayerState: 'idle' });
   };
 
 
@@ -82,6 +106,7 @@ export default function PresentPage() {
       return;
     }
     isPlaying.current = true;
+    updateDebug({ audioPlayerState: 'playing' });
 
     if (!audioContext.current || audioContext.current.state === 'closed') {
       try {
@@ -90,6 +115,7 @@ export default function PresentPage() {
       } catch (e) {
         console.error('Web Audio API is not supported in this browser', e);
         isPlaying.current = false;
+        updateDebug({ audioPlayerState: 'idle' });
         return;
       }
     }
@@ -111,6 +137,7 @@ export default function PresentPage() {
         offset += buffer.length;
     }
     audioQueue.current = [];
+    updateDebug({ chunksReceived: 0 });
 
     totalAudioDuration.current = outputBuffer.duration;
     
@@ -142,9 +169,11 @@ export default function PresentPage() {
 
     const newWs = new WebSocket('ws://147.93.102.137:8000/ws/presentation');
     ws.current = newWs;
+    updateDebug({ status: 'Connecting...' });
 
     newWs.onopen = () => {
       console.log('WebSocket connected');
+      updateDebug({ status: 'Connected' });
       newWs.send(
         JSON.stringify({
           type: 'load_presentation',
@@ -159,9 +188,11 @@ export default function PresentPage() {
       switch (message.type) {
         case 'connected':
           console.log(message.message);
+          updateDebug({ status: 'Connected (Server ACK)' });
           break;
         case 'presentation_loaded':
           console.log(message.message);
+          updateDebug({ status: 'Presentation Loaded' });
           // Now that presentation is loaded, start the first slide
           if (currentSlideIndex === 0) {
             newWs.send(JSON.stringify({ type: 'slide_start', slide_number: 1 }));
@@ -170,21 +201,25 @@ export default function PresentPage() {
         case 'audio_chunk':
           try {
             const audioData = decodeBase64(message.audio_data);
+            updateDebug({ 
+              chunksReceived: prev => prev.chunksReceived + 1,
+              lastChunkSize: audioData.byteLength 
+            });
             if (audioContext.current || (typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext))) {
                 if(!audioContext.current || audioContext.current.state === 'closed'){
                     audioContext.current = new (window.AudioContext || window.webkitAudioContext)();
                 }
               const audioBuffer = await audioContext.current.decodeAudioData(audioData);
               audioQueue.current.push(audioBuffer);
+              updateDebug({ audioPlayerState: 'buffering' });
             }
           } catch (e) {
             console.error('Error decoding audio data:', e);
           }
           break;
         case 'slide_started':
-          setCurrentCaption(
-            presentationScript.slides[message.slide_number - 1].script
-          );
+          const slideScript = presentationScript.slides[message.slide_number - 1];
+          updateDebug({ currentCaption: slideScript.script, totalChunks: slideScript.script_chunks.length });
           break;
         case 'slide_done':
            if (!message.is_qa) {
@@ -192,10 +227,12 @@ export default function PresentPage() {
            }
           break;
         case 'qa_response':
-          setCurrentCaption(`Q: ${message.question}\nA: ${message.answer}`);
+          const qaCaption = `Q: ${message.question}\nA: ${message.answer}`;
+          updateDebug({ currentCaption: qaCaption });
           stopAudio();
           try {
             const audioData = decodeBase64(message.audio_data);
+            updateDebug({ lastChunkSize: audioData.byteLength, chunksReceived: 1, totalChunks: 1 });
             if (audioContext.current) {
               const audioBuffer = await audioContext.current.decodeAudioData(audioData);
               audioQueue.current.push(audioBuffer);
@@ -207,6 +244,7 @@ export default function PresentPage() {
           break;
         case 'error':
           console.error(`WebSocket Error: ${message.message}`);
+          updateDebug({ status: `Error: ${message.message}` });
           toast({
             title: 'Presentation Error',
             description: message.message,
@@ -218,10 +256,12 @@ export default function PresentPage() {
 
     newWs.onclose = () => {
       console.log('WebSocket disconnected');
+      updateDebug({ status: 'Disconnected' });
     };
 
     newWs.onerror = (error) => {
       console.error('WebSocket error:', error);
+       updateDebug({ status: 'Error' });
     };
 
     return () => {
@@ -245,7 +285,13 @@ export default function PresentPage() {
       
       setCurrentSlideIndex(newSlideIndex);
       stopAudio();
-      setCurrentCaption('');
+      updateDebug({ 
+        currentSlide: newSlideIndex + 1,
+        currentCaption: '',
+        chunksReceived: 0,
+        totalChunks: 0,
+        lastChunkSize: 0,
+      });
 
       if (ws.current && ws.current.readyState === WebSocket.OPEN) {
         ws.current.send(JSON.stringify({ type: 'slide_start', slide_number: newSlideIndex + 1 }));
@@ -256,6 +302,7 @@ export default function PresentPage() {
     // Set initial slide after API is ready
     if(currentSlideIndex === -1 && presentationScript){
         setCurrentSlideIndex(0);
+        updateDebug({ currentSlide: 1 });
          if (ws.current && ws.current.readyState === WebSocket.OPEN) {
              ws.current.send(JSON.stringify({ type: 'slide_start', slide_number: 1 }));
          }
@@ -307,7 +354,7 @@ export default function PresentPage() {
     if (ws.current && ws.current.readyState === WebSocket.OPEN) {
       const question = "Can you explain this slide in simpler terms?"; // Hardcoded question
       ws.current.send(JSON.stringify({ type: 'interrupt', question }));
-      setCurrentCaption(`Asking: "${question}"`);
+      updateDebug({ currentCaption: `Asking: "${question}"`, audioPlayerState: 'idle' });
       stopAudio();
     }
   };
@@ -321,6 +368,20 @@ export default function PresentPage() {
       ref={carouselContainerRef}
       className="bg-gray-900 text-white w-full h-screen flex flex-col items-center justify-center relative group"
     >
+       <div className="absolute top-4 left-4 z-20 bg-black/50 p-2 rounded-lg text-xs w-80">
+        <h3 className="font-bold text-base mb-2">Debugger</h3>
+        <table className="w-full text-left">
+          <tbody>
+            <tr><td className="pr-2 opacity-70">WS Status:</td><td className="font-mono">{debugInfo.status}</td></tr>
+            <tr><td className="pr-2 opacity-70">Slide:</td><td className="font-mono">{debugInfo.currentSlide} / {slides.length}</td></tr>
+            <tr><td className="pr-2 opacity-70">Audio State:</td><td className="font-mono">{debugInfo.audioPlayerState}</td></tr>
+            <tr><td className="pr-2 opacity-70">Chunks:</td><td className="font-mono">{debugInfo.chunksReceived} / {debugInfo.totalChunks}</td></tr>
+            <tr><td className="pr-2 opacity-70">Last Chunk Size:</td><td className="font-mono">{debugInfo.lastChunkSize} bytes</td></tr>
+            <tr><td className="pr-2 opacity-70 align-top">Caption:</td><td className="font-mono h-20 overflow-y-auto block">{debugInfo.currentCaption}</td></tr>
+          </tbody>
+        </table>
+      </div>
+
       <Carousel setApi={setApi} className="w-full h-full" opts={{ loop: false }}>
         <CarouselContent className="h-full">
           {slides.map((slideUrl, index) => (
@@ -342,7 +403,7 @@ export default function PresentPage() {
       </Carousel>
 
       <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-black/80 to-transparent">
-        <p className="text-center text-xl whitespace-pre-wrap h-20 overflow-y-auto">{currentCaption}</p>
+        <p className="text-center text-xl whitespace-pre-wrap h-20 overflow-y-auto">{debugInfo.currentCaption}</p>
       </div>
 
        <div className="absolute bottom-0 left-0 right-0 w-full h-1 group-hover:h-2 transition-all">
@@ -352,7 +413,7 @@ export default function PresentPage() {
         />
       </div>
 
-      <div className="absolute top-4 right-4 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+      <div className="absolute top-4 right-4 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity z-10">
         <Button
           variant="ghost"
           size="icon"
@@ -386,5 +447,3 @@ export default function PresentPage() {
     </div>
   );
 }
-
-  
