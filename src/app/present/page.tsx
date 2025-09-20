@@ -97,9 +97,14 @@ export default function PresentPage() {
     }
   }, [isAuthenticated, slides, presentationScript, router]);
 
-  const updateDebug = (newInfo: Partial<DebugInfo>) => {
-    setDebugInfo(prev => ({...prev, ...newInfo}));
-  }
+  const updateDebug = (newInfo: Partial<DebugInfo> | ((prev: DebugInfo) => DebugInfo)) => {
+    setDebugInfo(prev => {
+        if (typeof newInfo === 'function') {
+            return newInfo(prev);
+        }
+        return { ...prev, ...newInfo };
+    });
+  };
 
   const stopNarration = (isPausing = false) => {
     if (progressInterval.current) {
@@ -108,7 +113,7 @@ export default function PresentPage() {
     }
 
     if (narrationSourceNode.current) {
-        if (isPausing && mainAudioBuffer.current && audioContext.current) {
+        if (isPausing && mainAudioBuffer.current && audioContext.current && narrationSourceNode.current.context.state === 'running') {
             pausedTime.current = audioContext.current.currentTime - playbackStartTime.current;
             resumeState.current = { buffer: mainAudioBuffer.current, playedDuration: pausedTime.current };
             updateDebug({ audioPlayerState: 'paused' });
@@ -245,7 +250,7 @@ export default function PresentPage() {
         case 'audio_chunk':
           try {
             const audioData = decodeBase64(message.audio_data);
-            updateDebug({ chunksReceived: p => p + 1, lastChunkSize: audioData.byteLength });
+            updateDebug(prev => ({ ...prev, chunksReceived: prev.chunksReceived + 1, lastChunkSize: audioData.byteLength }));
             if (audioContext.current || (typeof window !== 'undefined' && (window.AudioContext || (window as any).webkitAudioContext))) {
                 if(!audioContext.current || audioContext.current.state === 'closed'){ audioContext.current = new (window.AudioContext || (window as any).webkitAudioContext)(); }
               const audioBuffer = await audioContext.current.decodeAudioData(audioData);
@@ -274,11 +279,18 @@ export default function PresentPage() {
         case 'qa_response':
           setQaAnswer(message.answer);
           try {
-            const audioData = decodeBase64(message.audio_data);
-            if (audioContext.current) {
-              const audioBuffer = await audioContext.current.decodeAudioData(audioData);
-              audioQueue.current.unshift(audioBuffer); // Use unshift to play it next
-              playNextAudioChunk(true);
+            if (message.audio_data) {
+                const audioData = decodeBase64(message.audio_data);
+                if (audioContext.current) {
+                  const audioBuffer = await audioContext.current.decodeAudioData(audioData);
+                  // We manage a separate queue for QA audio to not interfere with main narration
+                  stopQaAudio(); // stop any previous qa answer
+                  const qaSource = audioContext.current.createBufferSource();
+                  qaSource.buffer = audioBuffer;
+                  qaSource.connect(audioContext.current.destination);
+                  qaSource.start();
+                  qaSourceNode.current = qaSource;
+                }
             }
           } catch (e) { console.error('Error decoding Q&A audio data:', e); }
           break;
@@ -299,7 +311,7 @@ export default function PresentPage() {
       stopQaAudio();
       audioContext.current?.close();
     };
-  }, [presentationScript, toast, api]);
+  }, [presentationScript, toast, api, currentSlideIndex]);
   
   useEffect(() => {
     if (!api) return;
@@ -351,6 +363,7 @@ export default function PresentPage() {
     recognition.current.onend = () => setIsListening(false);
     recognition.current.onerror = (event: any) => {
       console.error("Speech recognition error", event.error);
+      setIsListening(false);
       toast({ title: "Speech Recognition Error", description: event.error, variant: "destructive" });
     };
 
@@ -391,6 +404,7 @@ export default function PresentPage() {
   const askQuestion = () => {
     if (ws.current?.readyState === WebSocket.OPEN && transcribedText) {
       recognition.current?.stop();
+      setIsListening(false);
       ws.current.send(JSON.stringify({ type: 'interrupt', question: transcribedText }));
       setQaAnswer('Getting answer...');
     }
@@ -489,7 +503,7 @@ export default function PresentPage() {
       </div>
 
        <div className="absolute bottom-0 left-0 right-0 w-full h-1 group-hover:h-2 transition-all">
-        <Progress value={audioProgress} className="w-full h-full bg-gray-500/50 [&gt;div]:bg-red-600 rounded-none" />
+        <Progress value={audioProgress} className="w-full h-full bg-gray-500/50 [&>div]:bg-red-600 rounded-none" />
       </div>
 
       <div className="absolute top-4 right-4 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity z-10">
@@ -521,5 +535,3 @@ export default function PresentPage() {
     </div>
   );
 }
-
-    
