@@ -17,8 +17,21 @@ import {
 import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
 import Link from 'next/link';
-import { ArrowLeft, Send, Play, Pause, StopCircle, HelpCircle, RefreshCw, Radio } from 'lucide-react';
+import { ArrowLeft, Send, Play, Pause, StopCircle, HelpCircle, RefreshCw, Radio, Music } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
+
+// Helper to decode Base64
+const decodeBase64 = (base64: string) => {
+  if (typeof window === 'undefined') return new ArrayBuffer(0);
+  const binaryString = window.atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes.buffer;
+};
+
 
 export default function WebSocketTestPage() {
   const { isAuthenticated, presentationScript } = useAppContext();
@@ -36,11 +49,88 @@ export default function WebSocketTestPage() {
   const [model, setModel] = useState('tts-1');
   const [speed, setSpeed] = useState('1.0');
 
+  // Audio state
+  const audioContext = useRef<AudioContext | null>(null);
+  const audioQueue = useRef<AudioBuffer[]>([]);
+  const isPlaying = useRef(false);
+  const sourceNode = useRef<AudioBufferSourceNode | null>(null);
+  const [bufferedChunks, setBufferedChunks] = useState(0);
+
   useEffect(() => {
     if (!isAuthenticated) {
       router.push('/');
     }
-  }, [isAuthenticated, router]);
+    
+    // Initialize AudioContext
+    if (typeof window !== 'undefined' && !audioContext.current) {
+        try {
+            audioContext.current = new (window.AudioContext || window.webkitAudioContext)();
+        } catch (e) {
+            console.error("Web Audio API is not supported.", e);
+            toast({ title: "Audio Error", description: "Web Audio API is not supported in this browser.", variant: "destructive" });
+        }
+    }
+
+    return () => {
+        ws?.close();
+        audioContext.current?.close();
+    }
+  }, [isAuthenticated, router, toast, ws]);
+
+  const stopAudio = () => {
+    if (sourceNode.current) {
+      sourceNode.current.onended = null;
+      sourceNode.current.stop();
+      sourceNode.current = null;
+    }
+    audioQueue.current = [];
+    setBufferedChunks(0);
+    isPlaying.current = false;
+  };
+
+  const playNextAudioChunk = async () => {
+    if (isPlaying.current || audioQueue.current.length === 0) {
+      if(audioQueue.current.length === 0) {
+        toast({title: "Audio", description: "No audio chunks in buffer."});
+      }
+      return;
+    }
+    isPlaying.current = true;
+
+    if (!audioContext.current || audioContext.current.state === 'closed') {
+        audioContext.current = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    await audioContext.current.resume();
+
+    const totalLength = audioQueue.current.reduce((acc, buffer) => acc + buffer.length, 0);
+    const outputBuffer = audioContext.current.createBuffer(
+        1,
+        totalLength,
+        audioContext.current.sampleRate
+    );
+    const outputData = outputBuffer.getChannelData(0);
+    let offset = 0;
+    for (const buffer of audioQueue.current) {
+        outputData.set(buffer.getChannelData(0), offset);
+        offset += buffer.length;
+    }
+    
+    // Clear queue after concatenating
+    audioQueue.current = [];
+    setBufferedChunks(0);
+
+    const source = audioContext.current.createBufferSource();
+    source.buffer = outputBuffer;
+    source.connect(audioContext.current.destination);
+    source.onended = () => {
+      isPlaying.current = false;
+      sourceNode.current = null;
+      addMessage({type: 'local_event', message: "Audio playback finished."});
+    };
+    source.start();
+    sourceNode.current = source;
+    addMessage({type: 'local_event', message: `Playing ${outputBuffer.duration.toFixed(2)}s of audio.`});
+  };
 
   const connect = () => {
     if (ws) {
@@ -53,9 +143,31 @@ export default function WebSocketTestPage() {
       addMessage({ type: 'local_event', message: 'WebSocket Connected' });
     };
 
-    newWs.onmessage = (event) => {
+    newWs.onmessage = async (event) => {
       const message = JSON.parse(event.data);
       addMessage(message);
+
+      if (message.type === 'audio_chunk' || (message.type === 'qa_response' && message.audio_data)) {
+        try {
+            const audioData = decodeBase64(message.audio_data);
+            if (audioContext.current) {
+                const audioBuffer = await audioContext.current.decodeAudioData(audioData);
+                audioQueue.current.push(audioBuffer);
+                setBufferedChunks(prev => prev + 1);
+
+                // If it's a Q&A response, play it immediately
+                if (message.type === 'qa_response') {
+                    stopAudio(); // Stop any currently playing audio
+                    audioQueue.current.push(audioBuffer); // Re-add the buffer since stopAudio clears it
+                    setBufferedChunks(1);
+                    playNextAudioChunk();
+                }
+            }
+        } catch (e) {
+            console.error('Error decoding audio data:', e);
+            addMessage({ type: 'local_error', message: 'Failed to decode audio data.' });
+        }
+      }
     };
 
     newWs.onerror = (error) => {
@@ -129,6 +241,19 @@ export default function WebSocketTestPage() {
       </header>
       <main className="flex-1 p-4 md:p-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-1 flex flex-col gap-6">
+          <Card>
+            <CardHeader><CardTitle>Audio Control</CardTitle></CardHeader>
+            <CardContent className="space-y-2">
+                <div className="flex items-center justify-between text-sm">
+                    <span className="text-muted-foreground">Buffered Chunks:</span>
+                    <Badge variant="secondary">{bufferedChunks}</Badge>
+                </div>
+                 <div className="grid grid-cols-2 gap-2">
+                    <Button onClick={playNextAudioChunk}><Music className="mr-2"/> Play Buffered Audio</Button>
+                    <Button onClick={stopAudio} variant="destructive"><StopCircle className="mr-2"/> Stop & Clear</Button>
+                 </div>
+            </CardContent>
+          </Card>
           <Card>
             <CardHeader><CardTitle>1. Load Presentation</CardTitle></CardHeader>
             <CardContent>
