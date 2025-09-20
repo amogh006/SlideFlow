@@ -314,17 +314,6 @@ export default function PresentPage() {
 
   // --- Interrupt and Speech Recognition Logic ---
   const handleInterrupt = () => {
-    // Final guard against race conditions.
-    if (!debugInfo.isServerStreaming) {
-      console.warn("Interrupt blocked: Server is not streaming.");
-      toast({
-        title: "Cannot Interrupt",
-        description: "The presentation is not actively streaming audio.",
-        variant: "destructive"
-      });
-      return;
-    }
-
     if (audioRef.current && !audioRef.current.paused) {
       audioRef.current.pause();
       ws.current?.send(JSON.stringify({ type: 'stop' }));
