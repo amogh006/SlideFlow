@@ -62,6 +62,8 @@ export default function PresentPage() {
   const audioQueue = useRef<AudioBuffer[]>([]);
   const isPlaying = useRef(false);
   const sourceNode = useRef<AudioBufferSourceNode | null>(null);
+  
+  // State for pause and resume
   const playbackStartTime = useRef(0);
   const pauseOffset = useRef(0);
   const currentBuffer = useRef<AudioBuffer | null>(null);
@@ -103,14 +105,16 @@ export default function PresentPage() {
     if (sourceNode.current) {
       if (isPausing && audioContext.current) {
         // Calculate how much was played before pausing
-        pauseOffset.current = audioContext.current.currentTime - playbackStartTime.current;
+        pauseOffset.current = pauseOffset.current + (audioContext.current.currentTime - playbackStartTime.current);
         updateDebug({ audioPlayerState: 'paused' });
       } else {
+        // Full stop, reset everything
         pauseOffset.current = 0;
         currentBuffer.current = null;
-        audioQueue.current = []; // Clear the queue if not just pausing
+        audioQueue.current = [];
       }
-      sourceNode.current.onended = null;
+
+      sourceNode.current.onended = null; // Prevent onended from firing on manual stop
       try {
         sourceNode.current.stop();
       } catch (e) {
@@ -119,6 +123,7 @@ export default function PresentPage() {
       sourceNode.current = null;
     }
     isPlaying.current = false;
+    
     if (!isPausing) {
       setAudioProgress(0);
       updateDebug({ audioPlayerState: 'idle' });
@@ -127,7 +132,7 @@ export default function PresentPage() {
 
   const playNextAudioChunk = async (isQA = false) => {
     const queue = isQA ? qaAudioQueue.current : audioQueue.current;
-    if (isPlaying.current || (queue.length === 0 && !currentBuffer.current)) {
+    if (isPlaying.current || queue.length === 0) {
       return;
     }
 
@@ -141,9 +146,7 @@ export default function PresentPage() {
     }
     await audioContext.current.resume();
 
-    if (!currentBuffer.current) {
-      currentBuffer.current = queue.shift()!;
-    }
+    currentBuffer.current = queue.shift()!;
     if (!currentBuffer.current) return;
 
     isPlaying.current = true;
@@ -158,9 +161,11 @@ export default function PresentPage() {
     source.connect(audioContext.current!.destination);
 
     source.onended = () => {
+      if (sourceNode.current !== source) return; // a new source has been started
+      
       isPlaying.current = false;
       currentBuffer.current = null;
-      pauseOffset.current = 0;
+      pauseOffset.current = 0; // Reset pause offset after a chunk finishes naturally
 
       if (queue.length > 0) {
         playNextAudioChunk(isQA); // Play the next chunk in the queue
@@ -169,14 +174,14 @@ export default function PresentPage() {
       }
     };
     
-    source.start(0, pauseOffset.current);
-    playbackStartTime.current = audioContext.current.currentTime - pauseOffset.current;
+    source.start(0, 0); // Always start from beginning of a new chunk
+    playbackStartTime.current = audioContext.current.currentTime;
     sourceNode.current = source;
   };
 
   const resumeMainAudio = async () => {
     if (!currentBuffer.current) {
-        // Nothing to resume, just try playing the next chunk if available
+        // Nothing was paused, just try playing the next chunk if available
         playNextAudioChunk();
         return;
     }
@@ -193,6 +198,8 @@ export default function PresentPage() {
     source.connect(audioContext.current.destination);
 
     source.onended = () => {
+      if (sourceNode.current !== source) return;
+        
         isPlaying.current = false;
         currentBuffer.current = null;
         pauseOffset.current = 0;
@@ -204,7 +211,7 @@ export default function PresentPage() {
     };
 
     source.start(0, pauseOffset.current);
-    playbackStartTime.current = audioContext.current.currentTime - pauseOffset.current;
+    playbackStartTime.current = audioContext.current.currentTime;
     sourceNode.current = source;
   };
 
@@ -265,7 +272,7 @@ export default function PresentPage() {
               audioQueue.current.push(audioBuffer);
               updateDebug({ audioPlayerState: 'buffering' });
               
-              if (!isPlaying.current) {
+              if (!isPlaying.current && !isInterruptOpen) {
                   playNextAudioChunk();
               }
             }
@@ -437,11 +444,15 @@ export default function PresentPage() {
         setTranscribedText('');
         setInterruptOpen(true);
     } else {
-        toast({ title: "Cannot Interrupt", description: "No audio is currently playing to interrupt.", variant: "destructive" });
+        // Allow asking questions even if idle
+        setTranscribedText('');
+        setInterruptOpen(true);
+        updateDebug({audioPlayerState: 'paused'})
     }
   };
 
   const askQuestion = () => {
+    stopQA();
     if (ws.current && ws.current.readyState === WebSocket.OPEN && transcribedText) {
       ws.current.send(
         JSON.stringify({ type: 'interrupt', question: transcribedText })
@@ -478,7 +489,11 @@ export default function PresentPage() {
   
   const stopQA = () => {
     if(qaSourceNode.current) {
-        qaSourceNode.current.stop();
+        try {
+            qaSourceNode.current.stop();
+        } catch(e) {
+            console.warn("QA audio stop error", e);
+        }
         qaSourceNode.current = null;
     }
     qaAudioQueue.current = [];
@@ -489,16 +504,22 @@ export default function PresentPage() {
     if (isPlayingQA.current || qaAudioQueue.current.length === 0 || !audioContext.current) {
       return;
     }
+    await audioContext.current.resume();
 
     isPlayingQA.current = true;
     const bufferToPlay = qaAudioQueue.current.shift()!;
     
-    if (!bufferToPlay) return;
+    if (!bufferToPlay) {
+        isPlayingQA.current = false;
+        return;
+    }
 
     const source = audioContext.current.createBufferSource();
     source.buffer = bufferToPlay;
     source.connect(audioContext.current.destination);
     source.onended = () => {
+        if (qaSourceNode.current !== source) return;
+
         isPlayingQA.current = false;
         qaSourceNode.current = null;
         if(qaAudioQueue.current.length > 0) {
@@ -698,3 +719,5 @@ export default function PresentPage() {
     </div>
   );
 }
+
+    
