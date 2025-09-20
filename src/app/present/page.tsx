@@ -62,17 +62,13 @@ export default function PresentPage() {
   const audioQueue = useRef<AudioBuffer[]>([]);
   const isPlaying = useRef(false);
   const sourceNode = useRef<AudioBufferSourceNode | null>(null);
-  const resumeState = useRef<{ buffer: AudioBuffer; isQA: boolean } | null>(
-    null
-  );
+  const playbackStartTime = useRef(0);
+  const pauseOffset = useRef(0);
+  const currentBuffer = useRef<AudioBuffer | null>(null);
 
   const [currentSlideIndex, setCurrentSlideIndex] = useState(-1);
 
   const [audioProgress, setAudioProgress] = useState(0);
-  const totalAudioDuration = useRef(0);
-  const playbackStartTime = useRef(0);
-  const pausedTime = useRef(0);
-  const progressInterval = useRef<NodeJS.Timeout | null>(null);
 
   // Interrupt (Q&A) state
   const [isInterruptOpen, setInterruptOpen] = useState(false);
@@ -104,31 +100,16 @@ export default function PresentPage() {
   };
 
   const stopAudio = (isPausing = false) => {
-    if (progressInterval.current) {
-      clearInterval(progressInterval.current);
-      progressInterval.current = null;
-    }
-
     if (sourceNode.current) {
       if (isPausing && audioContext.current) {
-        pausedTime.current = audioContext.current.currentTime - playbackStartTime.current;
-        
-        // Don't modify the source buffer directly. Instead, just save the pause time.
-        // We'll use this to calculate the offset when resuming.
-        const remainingDuration = totalAudioDuration.current - pausedTime.current;
-
-        if(remainingDuration > 0) {
-            // We have something to resume. The buffer itself is still in sourceNode.current.buffer
-            resumeState.current = { buffer: sourceNode.current.buffer as AudioBuffer, isQA: false };
-            updateDebug({ audioPlayerState: 'paused' });
-        } else {
-            resumeState.current = null;
-        }
-
+        // Calculate how much was played before pausing
+        pauseOffset.current = audioContext.current.currentTime - playbackStartTime.current;
+        updateDebug({ audioPlayerState: 'paused' });
       } else {
-        resumeState.current = null;
+        pauseOffset.current = 0;
+        currentBuffer.current = null;
+        audioQueue.current = []; // Clear the queue if not just pausing
       }
-
       sourceNode.current.onended = null;
       try {
         sourceNode.current.stop();
@@ -137,23 +118,16 @@ export default function PresentPage() {
       }
       sourceNode.current = null;
     }
-
     isPlaying.current = false;
-
     if (!isPausing) {
-      audioQueue.current = [];
       setAudioProgress(0);
-      totalAudioDuration.current = 0;
-      playbackStartTime.current = 0;
-      pausedTime.current = 0;
-      resumeState.current = null;
       updateDebug({ audioPlayerState: 'idle' });
     }
   };
 
   const playNextAudioChunk = async (isQA = false) => {
     const queue = isQA ? qaAudioQueue.current : audioQueue.current;
-    if (isPlaying.current || queue.length === 0) {
+    if (isPlaying.current || (queue.length === 0 && !currentBuffer.current)) {
       return;
     }
 
@@ -167,66 +141,71 @@ export default function PresentPage() {
     }
     await audioContext.current.resume();
 
-    const bufferToPlay = queue.shift()!;
-    if (!bufferToPlay) return;
+    if (!currentBuffer.current) {
+      currentBuffer.current = queue.shift()!;
+    }
+    if (!currentBuffer.current) return;
 
     isPlaying.current = true;
     updateDebug({ audioPlayerState: 'playing' });
     
-    // For simplicity, we calculate progress based on chunks, not duration for streaming.
-    // A more accurate approach would be to track total duration as chunks arrive.
-    const playedChunks = debugInfo.chunksReceived - queue.length;
-    const progress = (playedChunks / debugInfo.totalChunks) * 100;
+    const playedChunks = debugInfo.chunksReceived - queue.length - (currentBuffer.current ? 1 : 0);
+    const progress = debugInfo.totalChunks > 0 ? (playedChunks / debugInfo.totalChunks) * 100 : 0;
     setAudioProgress(progress);
 
     const source = audioContext.current.createBufferSource();
-    source.buffer = bufferToPlay;
+    source.buffer = currentBuffer.current;
     source.connect(audioContext.current!.destination);
 
     source.onended = () => {
       isPlaying.current = false;
+      currentBuffer.current = null;
+      pauseOffset.current = 0;
+
       if (queue.length > 0) {
         playNextAudioChunk(isQA); // Play the next chunk in the queue
       } else {
         updateDebug({ audioPlayerState: 'idle' });
-        // Wait for the next user action.
       }
     };
-
-    source.start();
+    
+    source.start(0, pauseOffset.current);
+    playbackStartTime.current = audioContext.current.currentTime - pauseOffset.current;
     sourceNode.current = source;
   };
 
   const resumeMainAudio = async () => {
-      if (!resumeState.current || !audioContext.current) return;
+    if (!currentBuffer.current) {
+        // Nothing to resume, just try playing the next chunk if available
+        playNextAudioChunk();
+        return;
+    }
 
-      const { buffer } = resumeState.current;
-      const offset = pausedTime.current;
-      resumeState.current = null; // Clear resume state
+    // A buffer was paused, so we resume it
+    if (!audioContext.current) return;
 
-      if (offset >= buffer.duration) {
-          updateDebug({ audioPlayerState: 'idle' });
-          return; // Nothing to resume
-      }
-      
-      isPlaying.current = true;
-      updateDebug({ audioPlayerState: 'playing' });
+    await audioContext.current.resume();
+    isPlaying.current = true;
+    updateDebug({ audioPlayerState: 'playing' });
 
-      const source = audioContext.current.createBufferSource();
-      source.buffer = buffer;
-      source.connect(audioContext.current.destination);
+    const source = audioContext.current.createBufferSource();
+    source.buffer = currentBuffer.current;
+    source.connect(audioContext.current.destination);
 
-      source.onended = () => {
-          isPlaying.current = false;
-          sourceNode.current = null;
-          updateDebug({ audioPlayerState: 'idle' });
-      };
+    source.onended = () => {
+        isPlaying.current = false;
+        currentBuffer.current = null;
+        pauseOffset.current = 0;
+        if (audioQueue.current.length > 0) {
+            playNextAudioChunk();
+        } else {
+            updateDebug({ audioPlayerState: 'idle' });
+        }
+    };
 
-      source.start(0, offset); // Start from the paused offset
-      sourceNode.current = source;
-
-      // Adjust playback start time to account for the pause
-      playbackStartTime.current = audioContext.current.currentTime - offset;
+    source.start(0, pauseOffset.current);
+    playbackStartTime.current = audioContext.current.currentTime - pauseOffset.current;
+    sourceNode.current = source;
   };
 
 
@@ -259,7 +238,11 @@ export default function PresentPage() {
         case 'presentation_loaded':
           console.log(message.message);
           updateDebug({ status: 'Presentation Loaded' });
-          // Now that presentation is loaded, the other useEffect will trigger slide_start
+          if (currentSlideIndex !== -1 && ws.current && ws.current.readyState === WebSocket.OPEN) {
+             ws.current.send(
+              JSON.stringify({ type: 'slide_start', slide_number: currentSlideIndex + 1 })
+            );
+          }
           break;
         case 'audio_chunk':
           try {
@@ -297,14 +280,11 @@ export default function PresentPage() {
           if (slideScript) {
             updateDebug({
               currentCaption: slideScript.script,
-              totalChunks: slideScript.script_chunks.length,
+              totalChunks: slideScript.script_chunks?.length || 0,
               chunksReceived: 0,
             });
           }
           setAudioProgress(0);
-          totalAudioDuration.current = 0;
-          pausedTime.current = 0;
-          playbackStartTime.current = 0;
           break;
         case 'slide_done':
           console.log(`Slide ${message.slide_number} audio stream finished from server.`);
@@ -718,5 +698,3 @@ export default function PresentPage() {
     </div>
   );
 }
-
-    

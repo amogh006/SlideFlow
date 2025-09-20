@@ -12,6 +12,7 @@ export interface SlideScript {
   transition: string;
   estimated_time_seconds: number;
   slide_title: string;
+  script_chunks: string[];
 }
 
 // Define the shape of the entire presentation script
