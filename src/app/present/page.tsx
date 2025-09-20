@@ -14,9 +14,8 @@ import {
   CarouselPrevious,
 } from '@/components/ui/carousel';
 import { Button } from '@/components/ui/button';
-import { Expand, Hand, Mic, Shrink, X } from 'lucide-react';
+import { Expand, Hand, Mic, Pause, Play, RefreshCw, Shrink, X } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
-import { Progress } from '@/components/ui/progress';
 import {
   Dialog,
   DialogContent,
@@ -29,9 +28,9 @@ import {
 interface DebugInfo {
   status: string;
   currentSlide: number;
-  totalChunks: number;
-  chunksReceived: number;
-  audioPlayerState: 'idle' | 'playing' | 'buffering' | 'paused' | 'loaded';
+  audioPlayerState: 'idle' | 'playing' | 'paused' | 'buffering' | 'stopped';
+  isMainAudioPlaying: boolean;
+  isQaAudioPlaying: boolean;
   currentCaption: string;
 }
 
@@ -56,28 +55,27 @@ export default function PresentPage() {
   const carouselContainerRef = useRef<HTMLDivElement>(null);
   const [api, setApi] = useState<CarouselApi>();
   const [currentSlideIndex, setCurrentSlideIndex] = useState(-1);
-  
+
   const ws = useRef<WebSocket | null>(null);
-  const audioChunks = useRef<ArrayBuffer[]>([]);
-  const audioElement = useRef<HTMLAudioElement | null>(null);
-  const [audioSrc, setAudioSrc] = useState<string | null>(null);
-  const [audioProgress, setAudioProgress] = useState(0);
+  
+  // Audio state
+  const audioContext = useRef<AudioContext>();
+  const mainAudioQueue = useRef<AudioBuffer[]>([]);
+  const currentMainAudioSource = useRef<AudioBufferSourceNode | null>(null);
+  const qaAudioSource = useRef<AudioBufferSourceNode | null>(null);
 
   // Interrupt (Q&A) state
   const [isInterruptOpen, setInterruptOpen] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [transcribedText, setTranscribedText] = useState('');
-  const recognition = useRef<any>(null); // Using `any` for SpeechRecognition
-  const qaAudioElement = useRef<HTMLAudioElement | null>(null);
-  const [qaAudioSrc, setQaAudioSrc] = useState<string | null>(null);
-
+  const recognition = useRef<any>(null);
 
   const [debugInfo, setDebugInfo] = useState<DebugInfo>({
     status: 'Disconnected',
     currentSlide: 0,
-    totalChunks: 0,
-    chunksReceived: 0,
     audioPlayerState: 'idle',
+    isMainAudioPlaying: false,
+    isQaAudioPlaying: false,
     currentCaption: '',
   });
 
@@ -86,41 +84,84 @@ export default function PresentPage() {
       router.push('/upload');
     }
   }, [isAuthenticated, slides, presentationScript, router]);
+  
+   useEffect(() => {
+    if (typeof window !== 'undefined') {
+        audioContext.current = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    return () => {
+        audioContext.current?.close();
+    }
+  }, []);
 
   const updateDebug = (newInfo: Partial<DebugInfo>) => {
     setDebugInfo((prev) => ({ ...prev, ...newInfo }));
   };
   
   const stopMainAudio = () => {
-    if (audioElement.current) {
-        audioElement.current.pause();
-        audioElement.current.currentTime = 0;
+    if (currentMainAudioSource.current) {
+        currentMainAudioSource.current.onended = null; // Prevent onended from triggering next chunk
+        currentMainAudioSource.current.stop();
+        currentMainAudioSource.current = null;
     }
-    if (audioSrc) {
-        URL.revokeObjectURL(audioSrc);
-        setAudioSrc(null);
+    mainAudioQueue.current = [];
+    updateDebug({ audioPlayerState: 'stopped', isMainAudioPlaying: false });
+  }
+
+  const playMainAudio = async () => {
+    if (mainAudioQueue.current.length === 0) {
+      updateDebug({ isMainAudioPlaying: false, audioPlayerState: 'idle' });
+      return;
     }
-    audioChunks.current = [];
-    setAudioProgress(0);
-    updateDebug({ audioPlayerState: 'idle' });
-  };
+    if (!audioContext.current || audioContext.current.state === 'closed') {
+        audioContext.current = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    await audioContext.current.resume();
+
+    const buffer = mainAudioQueue.current.shift();
+    if (!buffer) return;
+
+    const source = audioContext.current.createBufferSource();
+    source.buffer = buffer;
+    source.connect(audioContext.current.destination);
+    source.onended = () => {
+        if (currentMainAudioSource.current === source) {
+            playMainAudio(); // Play next chunk
+        }
+    };
+    source.start();
+    currentMainAudioSource.current = source;
+    updateDebug({ audioPlayerState: 'playing', isMainAudioPlaying: true });
+  }
   
-  // Effect to handle audio source changes
-  useEffect(() => {
-    if (audioSrc && audioElement.current) {
-        audioElement.current.src = audioSrc;
-        audioElement.current.play().catch(e => console.error("Audio play failed:", e));
-        updateDebug({audioPlayerState: 'playing'});
+  const stopQA = () => {
+    if (qaAudioSource.current) {
+        qaAudioSource.current.stop();
+        qaAudioSource.current = null;
     }
-  }, [audioSrc]);
-  
-  // Effect for Q&A audio
-  useEffect(() => {
-    if (qaAudioSrc && qaAudioElement.current) {
-      qaAudioElement.current.src = qaAudioSrc;
-      qaAudioElement.current.play().catch(e => console.error("QA Audio play failed:", e));
+    updateDebug({ isQaAudioPlaying: false });
+  }
+
+  const playQAAudio = async (buffer: ArrayBuffer) => {
+    stopMainAudio(); // Ensure main audio is stopped
+    stopQA(); // Stop any previous Q&A audio
+
+    if (!audioContext.current || audioContext.current.state === 'closed') {
+        audioContext.current = new (window.AudioContext || window.webkitAudioContext)();
     }
-  }, [qaAudioSrc]);
+    await audioContext.current.resume();
+    const audioBuffer = await audioContext.current.decodeAudioData(buffer);
+
+    const source = audioContext.current.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(audioContext.current.destination);
+    source.onended = () => {
+        updateDebug({ isQaAudioPlaying: false });
+    };
+    source.start();
+    qaAudioSource.current = source;
+    updateDebug({ isQaAudioPlaying: true });
+  }
 
 
   useEffect(() => {
@@ -157,14 +198,17 @@ export default function PresentPage() {
           }
           break;
         case 'audio_chunk':
-          const audioData = decodeBase64(message.audio_data);
-          audioChunks.current.push(audioData);
-          updateDebug({
-              chunksReceived: (prev) => prev + 1,
-              audioPlayerState: 'buffering'
-          });
-          const progress = debugInfo.totalChunks > 0 ? (audioChunks.current.length / debugInfo.totalChunks) * 100 : 0;
-          setAudioProgress(progress);
+            if (!audioContext.current) break;
+            try {
+                const audioData = decodeBase64(message.audio_data);
+                const audioBuffer = await audioContext.current.decodeAudioData(audioData);
+                mainAudioQueue.current.push(audioBuffer);
+                if (!debugInfo.isMainAudioPlaying) {
+                   playMainAudio();
+                }
+            } catch (e) {
+                console.error("Error decoding audio chunk", e);
+            }
           break;
         case 'slide_started':
           stopMainAudio();
@@ -172,29 +216,18 @@ export default function PresentPage() {
           if (slideScript) {
             updateDebug({
               currentCaption: slideScript.script,
-              totalChunks: slideScript.script_chunks?.length || 0,
-              chunksReceived: 0,
             });
           }
-          setAudioProgress(0);
           break;
         case 'slide_done':
           console.log(`Slide ${message.slide_number} audio stream finished from server.`);
-          if (audioChunks.current.length > 0) {
-            const blob = new Blob(audioChunks.current, { type: 'audio/webm' });
-            const url = URL.createObjectURL(blob);
-            setAudioSrc(url);
-            updateDebug({audioPlayerState: 'loaded'});
-          }
           break;
         case 'qa_response':
            const qaCaption = `Q: ${message.question}\nA: ${message.answer}`;
            updateDebug({ currentCaption: qaCaption });
            try {
             const qaAudioData = decodeBase64(message.audio_data);
-            const blob = new Blob([qaAudioData], { type: 'audio/webm' });
-            const url = URL.createObjectURL(blob);
-            setQaAudioSrc(url);
+            playQAAudio(qaAudioData);
            } catch(e) {
             console.error("Error handling Q&A audio", e);
            }
@@ -217,6 +250,8 @@ export default function PresentPage() {
     newWs.onclose = () => {
       console.log('WebSocket disconnected');
       updateDebug({ status: 'Disconnected' });
+      stopMainAudio();
+      stopQA();
     };
 
     newWs.onerror = (error) => {
@@ -227,8 +262,6 @@ export default function PresentPage() {
     return () => {
       newWs?.close();
       ws.current = null;
-      stopMainAudio();
-      stopQA();
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [presentationScript, toast]);
@@ -241,7 +274,20 @@ export default function PresentPage() {
     const handleSelect = () => {
       const newSlideIndex = api.selectedScrollSnap();
       if (newSlideIndex === currentSlideIndex) return;
+      
       setCurrentSlideIndex(newSlideIndex);
+      
+      stopMainAudio();
+      updateDebug({
+        currentSlide: newSlideIndex + 1,
+        currentCaption: 'Loading slide...',
+      });
+
+      if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+        ws.current.send(
+          JSON.stringify({ type: 'slide_start', slide_number: newSlideIndex + 1 })
+        );
+      }
     };
     
     api.on('select', handleSelect);
@@ -255,26 +301,6 @@ export default function PresentPage() {
       api.off('select', handleSelect);
     };
   }, [api, currentSlideIndex]);
-
-
-  // Effect to handle slide changes (including initial load)
-  useEffect(() => {
-    if (currentSlideIndex === -1) return;
-
-    stopMainAudio();
-    updateDebug({
-      currentSlide: currentSlideIndex + 1,
-      currentCaption: 'Loading slide...',
-      chunksReceived: 0,
-      totalChunks: 0,
-    });
-
-    if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-      ws.current.send(
-        JSON.stringify({ type: 'slide_start', slide_number: currentSlideIndex + 1 })
-      );
-    }
-  }, [currentSlideIndex]);
 
 
   const handleFullScreenChange = () => {
@@ -319,10 +345,16 @@ export default function PresentPage() {
   // --- Interrupt and Speech Recognition Logic ---
 
   const handleInterrupt = () => {
-    if (audioElement.current && !audioElement.current.paused) {
-        audioElement.current.pause();
-        updateDebug({audioPlayerState: 'paused'});
+    if (!debugInfo.isMainAudioPlaying) {
+      toast({
+        title: "Cannot Interrupt",
+        description: "Interrupt is only available when presentation audio is playing.",
+        variant: "destructive",
+      });
+      return;
     }
+    stopMainAudio();
+    ws.current?.send(JSON.stringify({ type: 'stop' })); // Tell backend to stop sending audio
     setTranscribedText('');
     setInterruptOpen(true);
   };
@@ -341,22 +373,7 @@ export default function PresentPage() {
     stopRecording();
     stopQA();
     setInterruptOpen(false);
-    if(audioElement.current && audioElement.current.paused) {
-        audioElement.current.play();
-        updateDebug({audioPlayerState: 'playing'});
-    }
   };
-  
-  const stopQA = () => {
-    if (qaAudioElement.current) {
-        qaAudioElement.current.pause();
-        qaAudioElement.current.currentTime = 0;
-    }
-    if (qaAudioSrc) {
-        URL.revokeObjectURL(qaAudioSrc);
-        setQaAudioSrc(null);
-    }
-  }
 
   const startRecording = () => {
     if (recognition.current) {
@@ -419,12 +436,13 @@ export default function PresentPage() {
     return null; // Or a loading/redirecting message
   }
 
-  const updateAudioTime = () => {
-     if (audioElement.current) {
-      const { currentTime, duration } = audioElement.current;
-      if (duration > 0) {
-        setAudioProgress((currentTime / duration) * 100);
-      }
+  const replayCurrentSlide = () => {
+    if (ws.current && ws.current.readyState === WebSocket.OPEN && currentSlideIndex !== -1) {
+        stopMainAudio();
+        stopQA();
+        ws.current.send(
+            JSON.stringify({ type: 'slide_start', slide_number: currentSlideIndex + 1 })
+        );
     }
   }
 
@@ -434,9 +452,6 @@ export default function PresentPage() {
       ref={carouselContainerRef}
       className="bg-gray-900 text-white w-full h-screen flex flex-col items-center justify-center relative group"
     >
-      <audio ref={audioElement} onTimeUpdate={updateAudioTime} onEnded={() => updateDebug({ audioPlayerState: 'loaded' })} />
-      <audio ref={qaAudioElement} />
-
       <div className="absolute top-4 left-4 z-20 bg-black/50 p-2 rounded-lg text-xs w-80">
         <h3 className="font-bold text-base mb-2">Debugger</h3>
         <table className="w-full text-left">
@@ -452,14 +467,12 @@ export default function PresentPage() {
               </td>
             </tr>
             <tr>
-              <td className="pr-2 opacity-70">Audio State:</td>
-              <td className="font-mono">{debugInfo.audioPlayerState}</td>
+              <td className="pr-2 opacity-70">Main Audio:</td>
+              <td className="font-mono">{debugInfo.isMainAudioPlaying ? 'Playing' : 'Stopped'}</td>
             </tr>
-            <tr>
-              <td className="pr-2 opacity-70">Chunks:</td>
-              <td className="font-mono">
-                {debugInfo.chunksReceived} / {debugInfo.totalChunks}
-              </td>
+             <tr>
+              <td className="pr-2 opacity-70">Q&A Audio:</td>
+              <td className="font-mono">{debugInfo.isQaAudioPlaying ? 'Playing' : 'Stopped'}</td>
             </tr>
             <tr>
               <td className="pr-2 opacity-70 align-top">Caption:</td>
@@ -490,20 +503,25 @@ export default function PresentPage() {
         <CarouselPrevious className="absolute left-8 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity bg-black/50 hover:bg-black/75 border-none text-white h-12 w-12" />
         <CarouselNext className="absolute right-8 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity bg-black/50 hover:bg-black/75 border-none text-white h-12 w-12" />
       </Carousel>
+      
+      <div className="absolute bottom-6 left-6 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity z-10">
+         <Button
+          variant="ghost"
+          size="icon"
+          onClick={replayCurrentSlide}
+          className="text-white hover:bg-white/10 hover:text-white"
+        >
+          <RefreshCw className="h-5 w-5" />
+          <span className="sr-only">Replay Slide</span>
+        </Button>
+      </div>
 
-      <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-black/80 to-transparent">
+      <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-black/80 to-transparent pointer-events-none">
         <p className="text-center text-xl whitespace-pre-wrap h-20 overflow-y-auto">
           {debugInfo.currentCaption}
         </p>
       </div>
 
-      <div className="absolute bottom-0 left-0 right-0 w-full h-1 group-hover:h-2 transition-all">
-        <Progress
-          value={audioProgress}
-          className="w-full h-full bg-gray-500/50 [&>div]:bg-red-600 rounded-none"
-        />
-      </div>
-      
        <Dialog open={isInterruptOpen} onOpenChange={setInterruptOpen}>
         <DialogContent className="sm:max-w-[425px] bg-gray-800 border-gray-700 text-white">
           <DialogHeader>
@@ -542,7 +560,8 @@ export default function PresentPage() {
           variant="ghost"
           size="icon"
           onClick={handleInterrupt}
-          className="text-yellow-400 hover:bg-white/10 hover:text-yellow-300"
+          disabled={!debugInfo.isMainAudioPlaying}
+          className="text-yellow-400 hover:bg-white/10 hover:text-yellow-300 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <Hand className="h-5 w-5" />
           <span className="sr-only">Ask a question</span>
