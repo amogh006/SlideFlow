@@ -114,8 +114,8 @@ export default function PresentPage() {
 
     if (narrationSourceNode.current) {
         if (isPausing && mainAudioBuffer.current && audioContext.current && narrationSourceNode.current.context.state === 'running') {
-            pausedTime.current = audioContext.current.currentTime - playbackStartTime.current;
-            resumeState.current = { buffer: mainAudioBuffer.current, playedDuration: pausedTime.current };
+            const playedDuration = (audioContext.current.currentTime - playbackStartTime.current) + pausedTime.current;
+            resumeState.current = { buffer: mainAudioBuffer.current, playedDuration: playedDuration };
             updateDebug({ audioPlayerState: 'paused' });
         } else {
              resumeState.current = null;
@@ -156,21 +156,41 @@ export default function PresentPage() {
       }
     }
     
+    if (!audioContext.current || audioContext.current.state === 'closed') {
+        try { audioContext.current = new (window.AudioContext || (window as any).webkitAudioContext)(); } 
+        catch (e) { console.error('Web Audio API is not supported.', e); return; }
+    }
+    await audioContext.current.resume();
+
     let bufferToPlay: AudioBuffer | null = null;
     let resumeFrom = 0;
-
+    
     if (!isQA && resumeState.current) {
         bufferToPlay = resumeState.current.buffer;
         resumeFrom = resumeState.current.playedDuration;
+        pausedTime.current = resumeState.current.playedDuration;
         resumeState.current = null;
-        updateDebug({ currentCaption: presentationScript?.slides[currentSlideIndex].script ?? 'Resuming...' });
+        updateDebug({ currentCaption: presentationScript?.slides[currentSlideIndex]?.script ?? 'Resuming...' });
     } else if (audioQueue.current.length > 0) {
-        if (!audioContext.current || audioContext.current.state === 'closed') {
-          try { audioContext.current = new (window.AudioContext || (window as any).webkitAudioContext)(); } 
-          catch (e) { console.error('Web Audio API is not supported.', e); return; }
+        // Concatenate all available chunks for smoother playback
+        const totalLength = audioQueue.current.reduce((acc, buf) => acc + buf.length, 0);
+        const concatenatedBuffer = audioContext.current.createBuffer(
+            1,
+            totalLength,
+            audioQueue.current[0].sampleRate
+        );
+        let offset = 0;
+        for (const buffer of audioQueue.current) {
+            concatenatedBuffer.getChannelData(0).set(buffer.getChannelData(0), offset);
+            offset += buffer.length;
         }
-        await audioContext.current.resume();
-        bufferToPlay = audioQueue.current.shift()!;
+        bufferToPlay = concatenatedBuffer;
+        audioQueue.current = []; // Clear queue after concatenation
+        
+        if (!mainAudioBuffer.current) {
+            totalAudioDuration.current = bufferToPlay.duration;
+            pausedTime.current = 0;
+        }
     } else { return; }
     
     if (!bufferToPlay) return;
@@ -180,27 +200,24 @@ export default function PresentPage() {
     isPlaying.current = true;
     updateDebug({ audioPlayerState: 'playing' });
 
-    if (resumeFrom === 0) totalAudioDuration.current += bufferToPlay.duration;
-    
     const source = audioContext.current!.createBufferSource();
     source.buffer = bufferToPlay;
     source.connect(audioContext.current!.destination);
     
-    const onEnded = () => {
+    source.onended = () => {
       if(isQA) {
         qaSourceNode.current = null;
       } else {
         narrationSourceNode.current = null;
         isPlaying.current = false;
-        mainAudioBuffer.current = null; 
+        mainAudioBuffer.current = null; // Clear buffer after it has finished playing
         if (audioQueue.current.length > 0) {
-            playNextAudioChunk(false);
+            playNextAudioChunk(false); // Play next concatenated chunk if available
         } else {
             updateDebug({ audioPlayerState: 'idle' });
         }
       }
     };
-    source.onended = onEnded;
 
     source.start(0, resumeFrom); 
 
@@ -208,12 +225,12 @@ export default function PresentPage() {
       qaSourceNode.current = source;
     } else {
       narrationSourceNode.current = source;
-      playbackStartTime.current = audioContext.current!.currentTime - resumeFrom;
+      playbackStartTime.current = audioContext.current!.currentTime;
           
       if (progressInterval.current) clearInterval(progressInterval.current);
       progressInterval.current = setInterval(() => {
-        if (audioContext.current && isPlaying.current) {
-          const elapsedTime = (audioContext.current.currentTime - playbackStartTime.current);
+        if (audioContext.current && isPlaying.current && totalAudioDuration.current > 0) {
+          const elapsedTime = (audioContext.current.currentTime - playbackStartTime.current) + pausedTime.current;
           const progress = (elapsedTime / totalAudioDuration.current) * 100;
           setAudioProgress(Math.min(progress, 100));
         }
@@ -243,8 +260,8 @@ export default function PresentPage() {
           break;
         case 'presentation_loaded':
           updateDebug({ status: 'Presentation Loaded' });
-          if (currentSlideIndex === 0) {
-            newWs.send(JSON.stringify({ type: 'slide_start', slide_number: 1 }));
+          if (currentSlideIndex === 0 && newWs.readyState === WebSocket.OPEN) {
+             newWs.send(JSON.stringify({ type: 'slide_start', slide_number: 1 }));
           }
           break;
         case 'audio_chunk':
@@ -256,7 +273,7 @@ export default function PresentPage() {
               const audioBuffer = await audioContext.current.decodeAudioData(audioData);
               audioQueue.current.push(audioBuffer);
               updateDebug({ audioPlayerState: 'buffering' });
-              if (!isPlaying.current) playNextAudioChunk(false);
+              if (!isPlaying.current && !resumeState.current) playNextAudioChunk(false); // Don't play if paused
             }
           } catch (e) { console.error('Error decoding audio data:', e); }
           break;
@@ -274,7 +291,11 @@ export default function PresentPage() {
            playbackStartTime.current = 0;
           break;
         case 'slide_done':
-            console.log(`Slide ${message.slide_number} audio stream finished from server.`);
+             console.log(`Slide ${message.slide_number} audio stream finished from server.`);
+             // Once all chunks are received for a slide, play what's buffered.
+             if (!isPlaying.current && !resumeState.current) {
+                 playNextAudioChunk(false);
+             }
           break;
         case 'qa_response':
           setQaAnswer(message.answer);
@@ -283,8 +304,7 @@ export default function PresentPage() {
                 const audioData = decodeBase64(message.audio_data);
                 if (audioContext.current) {
                   const audioBuffer = await audioContext.current.decodeAudioData(audioData);
-                  // We manage a separate queue for QA audio to not interfere with main narration
-                  stopQaAudio(); // stop any previous qa answer
+                  stopQaAudio(); 
                   const qaSource = audioContext.current.createBufferSource();
                   qaSource.buffer = audioBuffer;
                   qaSource.connect(audioContext.current.destination);
@@ -311,7 +331,7 @@ export default function PresentPage() {
       stopQaAudio();
       audioContext.current?.close();
     };
-  }, [presentationScript, toast, api, currentSlideIndex]);
+  }, [presentationScript, toast, currentSlideIndex]);
   
   useEffect(() => {
     if (!api) return;
@@ -330,16 +350,14 @@ export default function PresentPage() {
     }
     
     api.on('select', handleSelect);
-    if(currentSlideIndex === -1 && presentationScript){
+
+    if(currentSlideIndex === -1 && presentationScript && slides.length > 0){
         setCurrentSlideIndex(0);
         updateDebug({ currentSlide: 1, currentCaption: 'Loading slide...' });
-         if (ws.current?.readyState === WebSocket.OPEN && presentationScript.slides.length > 0) {
-             ws.current.send(JSON.stringify({ type: 'slide_start', slide_number: 1 }));
-         }
     }
   
     return () => { api.off('select', handleSelect); };
-  }, [api, currentSlideIndex, presentationScript]);
+  }, [api, currentSlideIndex, presentationScript, slides]);
 
   // ASR Effect
   useEffect(() => {
@@ -351,12 +369,15 @@ export default function PresentPage() {
 
     recognition.current.onresult = (event: any) => {
       let finalTranscript = '';
+      let interimTranscript = '';
       for (let i = event.resultIndex; i < event.results.length; ++i) {
         if (event.results[i].isFinal) {
           finalTranscript += event.results[i][0].transcript;
+        } else {
+          interimTranscript += event.results[i][0].transcript;
         }
       }
-      setTranscribedText(prev => prev + finalTranscript);
+      setTranscribedText(finalTranscript || interimTranscript);
     };
 
     recognition.current.onstart = () => setIsListening(true);
@@ -384,7 +405,7 @@ export default function PresentPage() {
   };
 
   const handleInterrupt = () => {
-    stopNarration(true);
+    stopNarration(true); // true to indicate it's a pause
     setInterruptPopupOpen(true);
   };
 
@@ -404,7 +425,6 @@ export default function PresentPage() {
   const askQuestion = () => {
     if (ws.current?.readyState === WebSocket.OPEN && transcribedText) {
       recognition.current?.stop();
-      setIsListening(false);
       ws.current.send(JSON.stringify({ type: 'interrupt', question: transcribedText }));
       setQaAnswer('Getting answer...');
     }
@@ -498,7 +518,7 @@ export default function PresentPage() {
       </Dialog>
 
 
-      <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-black/80 to-transparent">
+      <div className="absolute bottom-6 left-0 right-0 p-6 bg-gradient-to-t from-black/80 to-transparent">
         <p className="text-center text-xl whitespace-pre-wrap h-20 overflow-y-auto">{debugInfo.currentCaption}</p>
       </div>
 
@@ -535,3 +555,5 @@ export default function PresentPage() {
     </div>
   );
 }
+
+    
