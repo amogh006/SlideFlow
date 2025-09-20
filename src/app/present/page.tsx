@@ -119,15 +119,20 @@ export default function PresentPage() {
           console.log(message.message);
           updateDebug({ status: 'Presentation Loaded' });
           if (api) {
-             const newIndex = api.selectedScrollSnap();
-             setCurrentSlideIndex(newIndex);
+            const newIndex = api.selectedScrollSnap();
+            if (newIndex === currentSlideIndex) {
+              setCurrentSlideIndex(-1); // Force a re-trigger if it's already 0
+            }
+            setCurrentSlideIndex(newIndex);
           }
           break;
 
         case 'slide_started':
           if (audioRef.current) {
             audioRef.current.src = '';
-            URL.revokeObjectURL(audioRef.current.src);
+            if (audioRef.current.src) {
+              URL.revokeObjectURL(audioRef.current.src);
+            }
           }
           audioChunksRef.current = [];
           updateDebug({
@@ -156,7 +161,9 @@ export default function PresentPage() {
                 // If it IS playing, we need to update the source without interruption
                 const currentTime = audioRef.current.currentTime;
                 // Revoke the old URL to prevent memory leaks
-                URL.revokeObjectURL(audioRef.current.src);
+                if (audioRef.current.src) {
+                    URL.revokeObjectURL(audioRef.current.src);
+                }
                 audioRef.current.src = objectURL;
                 audioRef.current.currentTime = currentTime;
                 audioRef.current.play().catch(e => console.error("Audio play failed on chunk update", e));
@@ -172,26 +179,30 @@ export default function PresentPage() {
         case 'qa_response':
           const qaCaption = `Q: ${message.question}\nA: ${message.answer}`;
           updateDebug({ currentCaption: qaCaption });
+          // Handle Q&A audio playback if necessary
+          if (message.audio_data && audioRef.current) {
+             if (!audioRef.current.paused) {
+                 audioRef.current.pause();
+             }
+             const qaAudioData = decodeBase64(message.audio_data);
+             const qaBlob = new Blob([qaAudioData], {type: 'audio/mpeg'});
+             const qaUrl = URL.createObjectURL(qaBlob);
+             const qaAudio = new Audio(qaUrl);
+             qaAudio.play();
+             qaAudio.onended = () => {
+                 URL.revokeObjectURL(qaUrl);
+             }
+          }
           break;
 
         case 'error':
           console.error(`WebSocket Error: ${message.message}`);
           updateDebug({ status: `Error: ${message.message}` });
-          if (message.message === 'Cannot interrupt when state is idle.') {
-             toast({
-                title: 'Cannot Interrupt',
-                description: 'The presentation is not actively speaking.',
-                variant: 'destructive',
-            });
-            // Close the dialog if it was opened erroneously
-            setInterruptOpen(false);
-          } else {
-            toast({
-                title: 'Presentation Error',
-                description: message.message,
-                variant: 'destructive',
-            });
-          }
+          toast({
+              title: 'Presentation Error',
+              description: message.message,
+              variant: 'destructive',
+          });
           break;
       }
     };
@@ -243,7 +254,9 @@ export default function PresentPage() {
     // Stop current audio playback and clear resources
     if (audioRef.current) {
       audioRef.current.pause();
-      URL.revokeObjectURL(audioRef.current.src);
+      if (audioRef.current.src) {
+         URL.revokeObjectURL(audioRef.current.src);
+      }
       audioRef.current.src = '';
     }
     audioChunksRef.current = [];
@@ -297,8 +310,6 @@ export default function PresentPage() {
 
   // --- Interrupt and Speech Recognition Logic ---
   const handleInterrupt = () => {
-    // We only send the interrupt message to the server, which then pauses itself.
-    // We also pause the audio on the client side.
     if (audioRef.current && !audioRef.current.paused) {
       audioRef.current.pause();
       ws.current?.send(JSON.stringify({ type: 'stop' }));
@@ -325,8 +336,7 @@ export default function PresentPage() {
   const closeInterrupt = () => {
     stopRecording();
     setInterruptOpen(false);
-    // Resume client-side audio
-    if (audioRef.current && audioRef.current.src) {
+    if (audioRef.current && audioRef.current.src && audioRef.current.paused) {
         audioRef.current.play().catch(e => console.error("Resume play failed", e));
     }
   };
