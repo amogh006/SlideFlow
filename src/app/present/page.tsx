@@ -119,7 +119,7 @@ export default function PresentPage() {
 
         if(remainingDuration > 0) {
             // We have something to resume. The buffer itself is still in sourceNode.current.buffer
-            resumeState.current = { buffer: sourceNode.current.buffer, isQA: false };
+            resumeState.current = { buffer: sourceNode.current.buffer as AudioBuffer, isQA: false };
             updateDebug({ audioPlayerState: 'paused' });
         } else {
             resumeState.current = null;
@@ -152,7 +152,8 @@ export default function PresentPage() {
   };
 
   const playNextAudioChunk = async (isQA = false) => {
-    if (isPlaying.current || audioQueue.current.length === 0) {
+    const queue = isQA ? qaAudioQueue.current : audioQueue.current;
+    if (isPlaying.current || queue.length === 0) {
       return;
     }
 
@@ -166,39 +167,34 @@ export default function PresentPage() {
     }
     await audioContext.current.resume();
 
-    const concatenatedBuffer = await concatenateAudioBuffers(audioQueue.current);
-    audioQueue.current = []; // Clear queue
-    if (!concatenatedBuffer) return;
+    const bufferToPlay = queue.shift()!;
+    if (!bufferToPlay) return;
 
     isPlaying.current = true;
     updateDebug({ audioPlayerState: 'playing' });
-    totalAudioDuration.current = concatenatedBuffer.duration;
     
+    // For simplicity, we calculate progress based on chunks, not duration for streaming.
+    // A more accurate approach would be to track total duration as chunks arrive.
+    const playedChunks = debugInfo.chunksReceived - queue.length;
+    const progress = (playedChunks / debugInfo.totalChunks) * 100;
+    setAudioProgress(progress);
+
     const source = audioContext.current.createBufferSource();
-    source.buffer = concatenatedBuffer;
+    source.buffer = bufferToPlay;
     source.connect(audioContext.current!.destination);
 
     source.onended = () => {
       isPlaying.current = false;
-      sourceNode.current = null;
-      updateDebug({ audioPlayerState: 'idle' });
-      // When narration finishes, we don't automatically do anything.
-      // We wait for the user to go to the next slide.
+      if (queue.length > 0) {
+        playNextAudioChunk(isQA); // Play the next chunk in the queue
+      } else {
+        updateDebug({ audioPlayerState: 'idle' });
+        // Wait for the next user action.
+      }
     };
 
-    source.start(0, 0);
+    source.start();
     sourceNode.current = source;
-    playbackStartTime.current = audioContext.current.currentTime;
-    pausedTime.current = 0;
-
-    if (progressInterval.current) clearInterval(progressInterval.current);
-    progressInterval.current = setInterval(() => {
-      if (audioContext.current && isPlaying.current) {
-        const elapsedTime = audioContext.current.currentTime - playbackStartTime.current;
-        const progress = (elapsedTime / totalAudioDuration.current) * 100;
-        setAudioProgress(Math.min(progress, 100));
-      }
-    }, 100);
   };
 
   const resumeMainAudio = async () => {
@@ -263,9 +259,7 @@ export default function PresentPage() {
         case 'presentation_loaded':
           console.log(message.message);
           updateDebug({ status: 'Presentation Loaded' });
-          if (api && currentSlideIndex !== -1) {
-             newWs.send(JSON.stringify({ type: 'slide_start', slide_number: currentSlideIndex + 1 }));
-          }
+          // Now that presentation is loaded, the other useEffect will trigger slide_start
           break;
         case 'audio_chunk':
           try {
@@ -288,7 +282,7 @@ export default function PresentPage() {
               audioQueue.current.push(audioBuffer);
               updateDebug({ audioPlayerState: 'buffering' });
               
-              if (!isPlaying.current && audioQueue.current.length === 1) {
+              if (!isPlaying.current) {
                   playNextAudioChunk();
               }
             }
@@ -298,12 +292,15 @@ export default function PresentPage() {
           break;
         case 'slide_started':
           stopAudio();
-          const slideScript = presentationScript.slides[message.slide_number - 1];
-          updateDebug({
-            currentCaption: slideScript.script,
-            totalChunks: slideScript.script_chunks.length,
-            chunksReceived: 0,
-          });
+          // The check for presentationScript.slides here is a safeguard
+          const slideScript = presentationScript?.slides[message.slide_number - 1];
+          if (slideScript) {
+            updateDebug({
+              currentCaption: slideScript.script,
+              totalChunks: slideScript.script_chunks.length,
+              chunksReceived: 0,
+            });
+          }
           setAudioProgress(0);
           totalAudioDuration.current = 0;
           pausedTime.current = 0;
@@ -311,21 +308,20 @@ export default function PresentPage() {
           break;
         case 'slide_done':
           console.log(`Slide ${message.slide_number} audio stream finished from server.`);
-          if (!isPlaying.current && audioQueue.current.length > 0) {
-            playNextAudioChunk();
-          }
+          // This is now less critical as we play chunks as they arrive.
           break;
         case 'qa_response':
           const qaCaption = `Q: ${message.question}\nA: ${message.answer}`;
           updateDebug({ currentCaption: qaCaption });
-          // Don't stop main audio, just play QA
           try {
             const audioData = decodeBase64(message.audio_data);
             updateDebug({ lastChunkSize: audioData.byteLength, chunksReceived: 1, totalChunks: 1 });
             if (audioContext.current) {
                 const audioBuffer = await audioContext.current.decodeAudioData(audioData);
                 qaAudioQueue.current.push(audioBuffer);
-                playNextQAChunk();
+                if(!isPlayingQA.current) {
+                   playNextQAChunk();
+                }
             }
           } catch (e) {
             console.error('Error decoding Q&A audio data:', e);
@@ -365,7 +361,9 @@ export default function PresentPage() {
         audioContext.current.close();
       }
     };
-  }, [presentationScript, toast, api, currentSlideIndex]);
+  // We only want this to run once when the presentation script is ready.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [presentationScript, toast]);
 
   useEffect(() => {
     if (!api) {
@@ -375,35 +373,41 @@ export default function PresentPage() {
     const handleSelect = () => {
       const newSlideIndex = api.selectedScrollSnap();
       if (newSlideIndex === currentSlideIndex) return;
-
       setCurrentSlideIndex(newSlideIndex);
-      stopAudio();
-      updateDebug({
-        currentSlide: newSlideIndex + 1,
-        currentCaption: 'Loading slide...',
-        chunksReceived: 0,
-        totalChunks: 0,
-        lastChunkSize: 0,
-      });
-
-      if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-        ws.current.send(
-          JSON.stringify({ type: 'slide_start', slide_number: newSlideIndex + 1 })
-        );
-      }
     };
-
+    
     api.on('select', handleSelect);
     
-    if(currentSlideIndex === -1 && presentationScript) {
+    // Set initial slide index
+    if(currentSlideIndex === -1) {
       setCurrentSlideIndex(0);
-      updateDebug({ currentSlide: 1, currentCaption: 'Loading slide...' });
     }
-
+    
     return () => {
       api.off('select', handleSelect);
     };
-  }, [api, currentSlideIndex, presentationScript]);
+  }, [api, currentSlideIndex]);
+
+
+  // Effect to handle slide changes (including initial load)
+  useEffect(() => {
+    if (currentSlideIndex === -1) return;
+
+    stopAudio();
+    updateDebug({
+      currentSlide: currentSlideIndex + 1,
+      currentCaption: 'Loading slide...',
+      chunksReceived: 0,
+      totalChunks: 0,
+      lastChunkSize: 0,
+    });
+
+    if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+      ws.current.send(
+        JSON.stringify({ type: 'slide_start', slide_number: currentSlideIndex + 1 })
+      );
+    }
+  }, [currentSlideIndex]);
 
 
   const handleFullScreenChange = () => {
@@ -501,30 +505,14 @@ export default function PresentPage() {
     isPlayingQA.current = false;
   }
   
-  const concatenateAudioBuffers = async (buffers: AudioBuffer[]): Promise<AudioBuffer | null> => {
-    if (buffers.length === 0 || !audioContext.current) return null;
-    
-    const totalLength = buffers.reduce((acc, buffer) => acc + buffer.length, 0);
-    const concatenatedBuffer = audioContext.current.createBuffer(
-      1, totalLength, audioContext.current.sampleRate
-    );
-    const outputData = concatenatedBuffer.getChannelData(0);
-    let offset = 0;
-    for (const buffer of buffers) {
-      outputData.set(buffer.getChannelData(0), offset);
-      offset += buffer.length;
-    }
-    return concatenatedBuffer;
-  }
-
   const playNextQAChunk = async () => {
     if (isPlayingQA.current || qaAudioQueue.current.length === 0 || !audioContext.current) {
       return;
     }
 
     isPlayingQA.current = true;
-    const bufferToPlay = await concatenateAudioBuffers(qaAudioQueue.current);
-    qaAudioQueue.current = []; // Clear queue
+    const bufferToPlay = qaAudioQueue.current.shift()!;
+    
     if (!bufferToPlay) return;
 
     const source = audioContext.current.createBufferSource();
@@ -533,6 +521,9 @@ export default function PresentPage() {
     source.onended = () => {
         isPlayingQA.current = false;
         qaSourceNode.current = null;
+        if(qaAudioQueue.current.length > 0) {
+            playNextQAChunk();
+        }
     };
     source.start();
     qaSourceNode.current = source;
@@ -727,3 +718,5 @@ export default function PresentPage() {
     </div>
   );
 }
+
+    
