@@ -31,8 +31,7 @@ interface DebugInfo {
   currentSlide: number;
   totalChunks: number;
   chunksReceived: number;
-  lastChunkSize: number;
-  audioPlayerState: 'idle' | 'playing' | 'buffering' | 'paused';
+  audioPlayerState: 'idle' | 'playing' | 'buffering' | 'paused' | 'loaded';
   currentCaption: string;
 }
 
@@ -56,20 +55,12 @@ export default function PresentPage() {
   const [isFullScreen, setIsFullScreen] = useState(false);
   const carouselContainerRef = useRef<HTMLDivElement>(null);
   const [api, setApi] = useState<CarouselApi>();
-
-  const ws = useRef<WebSocket | null>(null);
-  const audioContext = useRef<AudioContext | null>(null);
-  const audioQueue = useRef<AudioBuffer[]>([]);
-  const isPlaying = useRef(false);
-  const sourceNode = useRef<AudioBufferSourceNode | null>(null);
-  
-  // State for pause and resume
-  const playbackStartTime = useRef(0);
-  const pauseOffset = useRef(0);
-  const currentBuffer = useRef<AudioBuffer | null>(null);
-
   const [currentSlideIndex, setCurrentSlideIndex] = useState(-1);
-
+  
+  const ws = useRef<WebSocket | null>(null);
+  const audioChunks = useRef<ArrayBuffer[]>([]);
+  const audioElement = useRef<HTMLAudioElement | null>(null);
+  const [audioSrc, setAudioSrc] = useState<string | null>(null);
   const [audioProgress, setAudioProgress] = useState(0);
 
   // Interrupt (Q&A) state
@@ -77,16 +68,15 @@ export default function PresentPage() {
   const [isRecording, setIsRecording] = useState(false);
   const [transcribedText, setTranscribedText] = useState('');
   const recognition = useRef<any>(null); // Using `any` for SpeechRecognition
-  const qaAudioQueue = useRef<AudioBuffer[]>([]);
-  const isPlayingQA = useRef(false);
-  const qaSourceNode = useRef<AudioBufferSourceNode | null>(null);
+  const qaAudioElement = useRef<HTMLAudioElement | null>(null);
+  const [qaAudioSrc, setQaAudioSrc] = useState<string | null>(null);
+
 
   const [debugInfo, setDebugInfo] = useState<DebugInfo>({
     status: 'Disconnected',
     currentSlide: 0,
     totalChunks: 0,
     chunksReceived: 0,
-    lastChunkSize: 0,
     audioPlayerState: 'idle',
     currentCaption: '',
   });
@@ -100,120 +90,37 @@ export default function PresentPage() {
   const updateDebug = (newInfo: Partial<DebugInfo>) => {
     setDebugInfo((prev) => ({ ...prev, ...newInfo }));
   };
-
-  const stopAudio = (isPausing = false) => {
-    if (sourceNode.current) {
-      if (isPausing && audioContext.current) {
-        // Calculate how much was played before pausing
-        pauseOffset.current = pauseOffset.current + (audioContext.current.currentTime - playbackStartTime.current);
-        updateDebug({ audioPlayerState: 'paused' });
-      } else {
-        // Full stop, reset everything
-        pauseOffset.current = 0;
-        currentBuffer.current = null;
-        audioQueue.current = [];
-      }
-
-      sourceNode.current.onended = null; // Prevent onended from firing on manual stop
-      try {
-        sourceNode.current.stop();
-      } catch (e) {
-        console.warn('Audio stop error:', e);
-      }
-      sourceNode.current = null;
+  
+  const stopMainAudio = () => {
+    if (audioElement.current) {
+        audioElement.current.pause();
+        audioElement.current.currentTime = 0;
     }
-    isPlaying.current = false;
-    
-    if (!isPausing) {
-      setAudioProgress(0);
-      updateDebug({ audioPlayerState: 'idle' });
+    if (audioSrc) {
+        URL.revokeObjectURL(audioSrc);
+        setAudioSrc(null);
     }
+    audioChunks.current = [];
+    setAudioProgress(0);
+    updateDebug({ audioPlayerState: 'idle' });
   };
-
-  const playNextAudioChunk = async (isQA = false) => {
-    const queue = isQA ? qaAudioQueue.current : audioQueue.current;
-    if (isPlaying.current || queue.length === 0) {
-      return;
+  
+  // Effect to handle audio source changes
+  useEffect(() => {
+    if (audioSrc && audioElement.current) {
+        audioElement.current.src = audioSrc;
+        audioElement.current.play().catch(e => console.error("Audio play failed:", e));
+        updateDebug({audioPlayerState: 'playing'});
     }
-
-    if (!audioContext.current || audioContext.current.state === 'closed') {
-      try {
-        audioContext.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-      } catch (e) {
-        console.error('Web Audio API is not supported', e);
-        return;
-      }
+  }, [audioSrc]);
+  
+  // Effect for Q&A audio
+  useEffect(() => {
+    if (qaAudioSrc && qaAudioElement.current) {
+      qaAudioElement.current.src = qaAudioSrc;
+      qaAudioElement.current.play().catch(e => console.error("QA Audio play failed:", e));
     }
-    await audioContext.current.resume();
-
-    currentBuffer.current = queue.shift()!;
-    if (!currentBuffer.current) return;
-
-    isPlaying.current = true;
-    updateDebug({ audioPlayerState: 'playing' });
-    
-    const playedChunks = debugInfo.chunksReceived - queue.length - (currentBuffer.current ? 1 : 0);
-    const progress = debugInfo.totalChunks > 0 ? (playedChunks / debugInfo.totalChunks) * 100 : 0;
-    setAudioProgress(progress);
-
-    const source = audioContext.current.createBufferSource();
-    source.buffer = currentBuffer.current;
-    source.connect(audioContext.current!.destination);
-
-    source.onended = () => {
-      if (sourceNode.current !== source) return; // a new source has been started
-      
-      isPlaying.current = false;
-      currentBuffer.current = null;
-      pauseOffset.current = 0; // Reset pause offset after a chunk finishes naturally
-
-      if (queue.length > 0) {
-        playNextAudioChunk(isQA); // Play the next chunk in the queue
-      } else {
-        updateDebug({ audioPlayerState: 'idle' });
-      }
-    };
-    
-    source.start(0, 0); // Always start from beginning of a new chunk
-    playbackStartTime.current = audioContext.current.currentTime;
-    sourceNode.current = source;
-  };
-
-  const resumeMainAudio = async () => {
-    if (!currentBuffer.current) {
-        // Nothing was paused, just try playing the next chunk if available
-        playNextAudioChunk();
-        return;
-    }
-
-    // A buffer was paused, so we resume it
-    if (!audioContext.current) return;
-
-    await audioContext.current.resume();
-    isPlaying.current = true;
-    updateDebug({ audioPlayerState: 'playing' });
-
-    const source = audioContext.current.createBufferSource();
-    source.buffer = currentBuffer.current;
-    source.connect(audioContext.current.destination);
-
-    source.onended = () => {
-      if (sourceNode.current !== source) return;
-        
-        isPlaying.current = false;
-        currentBuffer.current = null;
-        pauseOffset.current = 0;
-        if (audioQueue.current.length > 0) {
-            playNextAudioChunk();
-        } else {
-            updateDebug({ audioPlayerState: 'idle' });
-        }
-    };
-
-    source.start(0, pauseOffset.current);
-    playbackStartTime.current = audioContext.current.currentTime;
-    sourceNode.current = source;
-  };
+  }, [qaAudioSrc]);
 
 
   useEffect(() => {
@@ -239,50 +146,28 @@ export default function PresentPage() {
 
       switch (message.type) {
         case 'connected':
-          console.log(message.message);
           updateDebug({ status: 'Connected (Server ACK)' });
           break;
         case 'presentation_loaded':
-          console.log(message.message);
           updateDebug({ status: 'Presentation Loaded' });
-          if (currentSlideIndex !== -1 && ws.current && ws.current.readyState === WebSocket.OPEN) {
+           if (currentSlideIndex !== -1 && ws.current?.readyState === WebSocket.OPEN) {
              ws.current.send(
               JSON.stringify({ type: 'slide_start', slide_number: currentSlideIndex + 1 })
             );
           }
           break;
         case 'audio_chunk':
-          try {
-            const audioData = decodeBase64(message.audio_data);
-            updateDebug({
+          const audioData = decodeBase64(message.audio_data);
+          audioChunks.current.push(audioData);
+          updateDebug({
               chunksReceived: (prev) => prev + 1,
-              lastChunkSize: audioData.byteLength,
-            });
-            if (
-              audioContext.current ||
-              (typeof window !== 'undefined' &&
-                (window.AudioContext || (window as any).webkitAudioContext))
-            ) {
-              if (!audioContext.current || audioContext.current.state === 'closed') {
-                audioContext.current = new (window.AudioContext ||
-                  (window as any).webkitAudioContext)();
-              }
-              const audioBuffer =
-                await audioContext.current.decodeAudioData(audioData);
-              audioQueue.current.push(audioBuffer);
-              updateDebug({ audioPlayerState: 'buffering' });
-              
-              if (!isPlaying.current && !isInterruptOpen) {
-                  playNextAudioChunk();
-              }
-            }
-          } catch (e) {
-            console.error('Error decoding audio data:', e);
-          }
+              audioPlayerState: 'buffering'
+          });
+          const progress = debugInfo.totalChunks > 0 ? (audioChunks.current.length / debugInfo.totalChunks) * 100 : 0;
+          setAudioProgress(progress);
           break;
         case 'slide_started':
-          stopAudio();
-          // The check for presentationScript.slides here is a safeguard
+          stopMainAudio();
           const slideScript = presentationScript?.slides[message.slide_number - 1];
           if (slideScript) {
             updateDebug({
@@ -295,24 +180,24 @@ export default function PresentPage() {
           break;
         case 'slide_done':
           console.log(`Slide ${message.slide_number} audio stream finished from server.`);
-          // This is now less critical as we play chunks as they arrive.
+          if (audioChunks.current.length > 0) {
+            const blob = new Blob(audioChunks.current, { type: 'audio/webm' });
+            const url = URL.createObjectURL(blob);
+            setAudioSrc(url);
+            updateDebug({audioPlayerState: 'loaded'});
+          }
           break;
         case 'qa_response':
-          const qaCaption = `Q: ${message.question}\nA: ${message.answer}`;
-          updateDebug({ currentCaption: qaCaption });
-          try {
-            const audioData = decodeBase64(message.audio_data);
-            updateDebug({ lastChunkSize: audioData.byteLength, chunksReceived: 1, totalChunks: 1 });
-            if (audioContext.current) {
-                const audioBuffer = await audioContext.current.decodeAudioData(audioData);
-                qaAudioQueue.current.push(audioBuffer);
-                if(!isPlayingQA.current) {
-                   playNextQAChunk();
-                }
-            }
-          } catch (e) {
-            console.error('Error decoding Q&A audio data:', e);
-          }
+           const qaCaption = `Q: ${message.question}\nA: ${message.answer}`;
+           updateDebug({ currentCaption: qaCaption });
+           try {
+            const qaAudioData = decodeBase64(message.audio_data);
+            const blob = new Blob([qaAudioData], { type: 'audio/webm' });
+            const url = URL.createObjectURL(blob);
+            setQaAudioSrc(url);
+           } catch(e) {
+            console.error("Error handling Q&A audio", e);
+           }
           break;
         case 'error':
           console.error(`WebSocket Error: ${message.message}`);
@@ -342,13 +227,9 @@ export default function PresentPage() {
     return () => {
       newWs?.close();
       ws.current = null;
-      stopAudio();
+      stopMainAudio();
       stopQA();
-      if (audioContext.current) {
-        audioContext.current.close();
-      }
     };
-  // We only want this to run once when the presentation script is ready.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [presentationScript, toast]);
 
@@ -380,13 +261,12 @@ export default function PresentPage() {
   useEffect(() => {
     if (currentSlideIndex === -1) return;
 
-    stopAudio();
+    stopMainAudio();
     updateDebug({
       currentSlide: currentSlideIndex + 1,
       currentCaption: 'Loading slide...',
       chunksReceived: 0,
       totalChunks: 0,
-      lastChunkSize: 0,
     });
 
     if (ws.current && ws.current.readyState === WebSocket.OPEN) {
@@ -439,16 +319,12 @@ export default function PresentPage() {
   // --- Interrupt and Speech Recognition Logic ---
 
   const handleInterrupt = () => {
-    if (isPlaying.current) {
-        stopAudio(true); // Pause main narration
-        setTranscribedText('');
-        setInterruptOpen(true);
-    } else {
-        // Allow asking questions even if idle
-        setTranscribedText('');
-        setInterruptOpen(true);
-        updateDebug({audioPlayerState: 'paused'})
+    if (audioElement.current && !audioElement.current.paused) {
+        audioElement.current.pause();
+        updateDebug({audioPlayerState: 'paused'});
     }
+    setTranscribedText('');
+    setInterruptOpen(true);
   };
 
   const askQuestion = () => {
@@ -465,8 +341,22 @@ export default function PresentPage() {
     stopRecording();
     stopQA();
     setInterruptOpen(false);
-    resumeMainAudio();
+    if(audioElement.current && audioElement.current.paused) {
+        audioElement.current.play();
+        updateDebug({audioPlayerState: 'playing'});
+    }
   };
+  
+  const stopQA = () => {
+    if (qaAudioElement.current) {
+        qaAudioElement.current.pause();
+        qaAudioElement.current.currentTime = 0;
+    }
+    if (qaAudioSrc) {
+        URL.revokeObjectURL(qaAudioSrc);
+        setQaAudioSrc(null);
+    }
+  }
 
   const startRecording = () => {
     if (recognition.current) {
@@ -487,49 +377,6 @@ export default function PresentPage() {
     }
   };
   
-  const stopQA = () => {
-    if(qaSourceNode.current) {
-        try {
-            qaSourceNode.current.stop();
-        } catch(e) {
-            console.warn("QA audio stop error", e);
-        }
-        qaSourceNode.current = null;
-    }
-    qaAudioQueue.current = [];
-    isPlayingQA.current = false;
-  }
-  
-  const playNextQAChunk = async () => {
-    if (isPlayingQA.current || qaAudioQueue.current.length === 0 || !audioContext.current) {
-      return;
-    }
-    await audioContext.current.resume();
-
-    isPlayingQA.current = true;
-    const bufferToPlay = qaAudioQueue.current.shift()!;
-    
-    if (!bufferToPlay) {
-        isPlayingQA.current = false;
-        return;
-    }
-
-    const source = audioContext.current.createBufferSource();
-    source.buffer = bufferToPlay;
-    source.connect(audioContext.current.destination);
-    source.onended = () => {
-        if (qaSourceNode.current !== source) return;
-
-        isPlayingQA.current = false;
-        qaSourceNode.current = null;
-        if(qaAudioQueue.current.length > 0) {
-            playNextQAChunk();
-        }
-    };
-    source.start();
-    qaSourceNode.current = source;
-  }
-
   useEffect(() => {
     // Initialize speech recognition
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -572,11 +419,24 @@ export default function PresentPage() {
     return null; // Or a loading/redirecting message
   }
 
+  const updateAudioTime = () => {
+     if (audioElement.current) {
+      const { currentTime, duration } = audioElement.current;
+      if (duration > 0) {
+        setAudioProgress((currentTime / duration) * 100);
+      }
+    }
+  }
+
+
   return (
     <div
       ref={carouselContainerRef}
       className="bg-gray-900 text-white w-full h-screen flex flex-col items-center justify-center relative group"
     >
+      <audio ref={audioElement} onTimeUpdate={updateAudioTime} onEnded={() => updateDebug({ audioPlayerState: 'loaded' })} />
+      <audio ref={qaAudioElement} />
+
       <div className="absolute top-4 left-4 z-20 bg-black/50 p-2 rounded-lg text-xs w-80">
         <h3 className="font-bold text-base mb-2">Debugger</h3>
         <table className="w-full text-left">
@@ -600,10 +460,6 @@ export default function PresentPage() {
               <td className="font-mono">
                 {debugInfo.chunksReceived} / {debugInfo.totalChunks}
               </td>
-            </tr>
-            <tr>
-              <td className="pr-2 opacity-70">Last Chunk Size:</td>
-              <td className="font-mono">{debugInfo.lastChunkSize} bytes</td>
             </tr>
             <tr>
               <td className="pr-2 opacity-70 align-top">Caption:</td>
@@ -719,5 +575,3 @@ export default function PresentPage() {
     </div>
   );
 }
-
-    
