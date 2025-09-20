@@ -14,7 +14,8 @@ import {
   CarouselPrevious,
 } from '@/components/ui/carousel';
 import { Button } from '@/components/ui/button';
-import { Expand, Mic, Shrink, X } from 'lucide-react';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
+import { Expand, Mic, Shrink, X, Hand, MicOff } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 import { Progress } from '@/components/ui/progress';
 
@@ -27,6 +28,12 @@ interface DebugInfo {
   audioPlayerState: 'idle' | 'playing' | 'buffering' | 'paused';
   currentCaption: string;
 }
+
+// Check for SpeechRecognition API
+const SpeechRecognition =
+  typeof window !== 'undefined'
+    ? (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
+    : null;
 
 // Helper to decode Base64
 const decodeBase64 = (base64: string) => {
@@ -53,9 +60,10 @@ export default function PresentPage() {
   const audioContext = useRef<AudioContext | null>(null);
   const audioQueue = useRef<AudioBuffer[]>([]);
   const isPlaying = useRef(false);
-  const sourceNode = useRef<AudioBufferSourceNode | null>(null);
+  const narrationSourceNode = useRef<AudioBufferSourceNode | null>(null);
+  const qaSourceNode = useRef<AudioBufferSourceNode | null>(null);
   const mainAudioBuffer = useRef<AudioBuffer | null>(null);
-  const resumeState = useRef<{ buffer: AudioBuffer; isQA: boolean } | null>(null);
+  const resumeState = useRef<{ buffer: AudioBuffer; playedDuration: number } | null>(null);
 
   const [currentSlideIndex, setCurrentSlideIndex] = useState(-1);
 
@@ -64,6 +72,14 @@ export default function PresentPage() {
   const playbackStartTime = useRef(0);
   const pausedTime = useRef(0);
   const progressInterval = useRef<NodeJS.Timeout | null>(null);
+
+  // Interrupt and ASR state
+  const [isInterruptPopupOpen, setInterruptPopupOpen] = useState(false);
+  const [isListening, setIsListening] = useState(false);
+  const [transcribedText, setTranscribedText] = useState('');
+  const recognition = useRef<any | null>(null);
+  const [qaAnswer, setQaAnswer] = useState('');
+
 
   const [debugInfo, setDebugInfo] = useState<DebugInfo>({
     status: 'Disconnected',
@@ -85,49 +101,26 @@ export default function PresentPage() {
     setDebugInfo(prev => ({...prev, ...newInfo}));
   }
 
-  const stopAudio = (isPausing = false) => {
+  const stopNarration = (isPausing = false) => {
     if (progressInterval.current) {
       clearInterval(progressInterval.current);
       progressInterval.current = null;
     }
 
-    if (sourceNode.current) {
-        // If pausing, calculate how much was played
+    if (narrationSourceNode.current) {
         if (isPausing && mainAudioBuffer.current && audioContext.current) {
             pausedTime.current = audioContext.current.currentTime - playbackStartTime.current;
-            const remainingSamples = Math.max(0, mainAudioBuffer.current.length - Math.floor(pausedTime.current * mainAudioBuffer.current.sampleRate));
-            
-            if (remainingSamples > 0) {
-                const remainingBuffer = audioContext.current.createBuffer(
-                    mainAudioBuffer.current.numberOfChannels,
-                    remainingSamples,
-                    mainAudioBuffer.current.sampleRate
-                );
-                for(let i=0; i < mainAudioBuffer.current.numberOfChannels; i++) {
-                    const channelData = mainAudioBuffer.current.getChannelData(i);
-                    const remainingChannelData = new Float32Array(remainingSamples);
-                    remainingChannelData.set(channelData.subarray(mainAudioBuffer.current.length - remainingSamples));
-                    remainingBuffer.getChannelData(i).set(remainingChannelData);
-                }
-                resumeState.current = { buffer: remainingBuffer, isQA: false };
-                updateDebug({ audioPlayerState: 'paused' });
-            } else {
-                 resumeState.current = null;
-            }
+            resumeState.current = { buffer: mainAudioBuffer.current, playedDuration: pausedTime.current };
+            updateDebug({ audioPlayerState: 'paused' });
         } else {
              resumeState.current = null;
         }
 
-      sourceNode.current.onended = null; // Prevent onended from firing on manual stop
-      try {
-        sourceNode.current.stop();
-      } catch (e) {
-        console.warn("Audio stop error:", e)
-      }
-      sourceNode.current = null;
+      narrationSourceNode.current.onended = null;
+      try { narrationSourceNode.current.stop(); } catch (e) { console.warn("Narration stop error:", e) }
+      narrationSourceNode.current = null;
     }
     
-    // Only clear queue if not pausing
     if (!isPausing) {
         audioQueue.current = [];
         mainAudioBuffer.current = null;
@@ -140,115 +133,87 @@ export default function PresentPage() {
     isPlaying.current = false;
   };
 
+  const stopQaAudio = () => {
+    if(qaSourceNode.current) {
+      qaSourceNode.current.onended = null;
+      try { qaSourceNode.current.stop() } catch(e) { console.warn("QA Audio stop error:", e) }
+      qaSourceNode.current = null;
+    }
+  }
+
 
   const playNextAudioChunk = async (isQA = false) => {
-    if (isPlaying.current || (audioQueue.current.length === 0 && !resumeState.current)) {
-        return;
+    if (isQA) {
+      stopQaAudio();
+    } else {
+      if (isPlaying.current || (audioQueue.current.length === 0 && !resumeState.current)) {
+          return;
+      }
     }
     
     let bufferToPlay: AudioBuffer | null = null;
-    let isResuming = false;
+    let resumeFrom = 0;
 
     if (!isQA && resumeState.current) {
         bufferToPlay = resumeState.current.buffer;
+        resumeFrom = resumeState.current.playedDuration;
         resumeState.current = null;
-        isResuming = true;
         updateDebug({ currentCaption: presentationScript?.slides[currentSlideIndex].script ?? 'Resuming...' });
     } else if (audioQueue.current.length > 0) {
         if (!audioContext.current || audioContext.current.state === 'closed') {
-          try {
-            audioContext.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-          } catch (e) {
-            console.error('Web Audio API is not supported in this browser', e);
-            return;
-          }
+          try { audioContext.current = new (window.AudioContext || (window as any).webkitAudioContext)(); } 
+          catch (e) { console.error('Web Audio API is not supported.', e); return; }
         }
         await audioContext.current.resume();
-
-        // For streaming, we play one chunk at a time.
-        // For QA, we concatenate as it's usually a single response.
-        if (isQA) {
-            const totalLength = audioQueue.current.reduce((acc, buffer) => acc + buffer.length, 0);
-            if(totalLength === 0) return;
-
-            const concatenatedBuffer = audioContext.current.createBuffer(
-                1, totalLength, audioContext.current.sampleRate
-            );
-            const outputData = concatenatedBuffer.getChannelData(0);
-            let offset = 0;
-            for (const buffer of audioQueue.current) {
-                outputData.set(buffer.getChannelData(0), offset);
-                offset += buffer.length;
-            }
-            audioQueue.current = [];
-            bufferToPlay = concatenatedBuffer;
-        } else {
-            bufferToPlay = audioQueue.current.shift()!;
-        }
-    } else {
-        // Nothing to play
-        return;
-    }
+        bufferToPlay = audioQueue.current.shift()!;
+    } else { return; }
     
     if (!bufferToPlay) return;
 
-    if (!isQA) {
-        mainAudioBuffer.current = bufferToPlay; // Store the current chunk for pausing logic
-    }
+    if (!isQA) mainAudioBuffer.current = bufferToPlay;
 
     isPlaying.current = true;
     updateDebug({ audioPlayerState: 'playing' });
 
-    if (!isResuming) {
-        // In streaming, total duration becomes a running total.
-        totalAudioDuration.current += bufferToPlay.duration;
-    }
+    if (resumeFrom === 0) totalAudioDuration.current += bufferToPlay.duration;
     
     const source = audioContext.current!.createBufferSource();
     source.buffer = bufferToPlay;
     source.connect(audioContext.current!.destination);
     
-    source.onended = () => {
-      sourceNode.current = null;
-      isPlaying.current = false;
-      mainAudioBuffer.current = null; // Clear the chunk that just played
-      
-      // If it was a QA audio, we might need to resume main audio.
+    const onEnded = () => {
       if(isQA) {
-        updateDebug({ audioPlayerState: 'idle' });
-        if(resumeState.current) {
-            playNextAudioChunk(false);
-        } else {
-            stopAudio();
-        }
+        qaSourceNode.current = null;
       } else {
-        // It was a narration slide. Check if there are more chunks to play.
+        narrationSourceNode.current = null;
+        isPlaying.current = false;
+        mainAudioBuffer.current = null; 
         if (audioQueue.current.length > 0) {
             playNextAudioChunk(false);
         } else {
             updateDebug({ audioPlayerState: 'idle' });
-             // Don't reset progress bar here, wait for slide change
         }
       }
     };
+    source.onended = onEnded;
 
-    source.start(0, 0); // Start from the beginning
-    sourceNode.current = source;
+    source.start(0, resumeFrom); 
 
-    if (isResuming) {
-        playbackStartTime.current = audioContext.current!.currentTime - pausedTime.current;
+    if (isQA) {
+      qaSourceNode.current = source;
     } else {
-        playbackStartTime.current = audioContext.current!.currentTime;
+      narrationSourceNode.current = source;
+      playbackStartTime.current = audioContext.current!.currentTime - resumeFrom;
+          
+      if (progressInterval.current) clearInterval(progressInterval.current);
+      progressInterval.current = setInterval(() => {
+        if (audioContext.current && isPlaying.current) {
+          const elapsedTime = (audioContext.current.currentTime - playbackStartTime.current);
+          const progress = (elapsedTime / totalAudioDuration.current) * 100;
+          setAudioProgress(Math.min(progress, 100));
+        }
+      }, 100);
     }
-    
-    if (progressInterval.current) clearInterval(progressInterval.current);
-    progressInterval.current = setInterval(() => {
-      if (audioContext.current && (isPlaying.current || resumeState.current)) {
-        const elapsedTime = (audioContext.current.currentTime - playbackStartTime.current);
-        const progress = (elapsedTime / totalAudioDuration.current) * 100;
-        setAudioProgress(Math.min(progress, 100));
-      }
-    }, 100);
   };
 
 
@@ -260,14 +225,8 @@ export default function PresentPage() {
     updateDebug({ status: 'Connecting...' });
 
     newWs.onopen = () => {
-      console.log('WebSocket connected');
       updateDebug({ status: 'Connected' });
-      newWs.send(
-        JSON.stringify({
-          type: 'load_presentation',
-          data: presentationScript,
-        })
-      );
+      newWs.send(JSON.stringify({ type: 'load_presentation', data: presentationScript }));
     };
 
     newWs.onmessage = async (event) => {
@@ -275,11 +234,9 @@ export default function PresentPage() {
 
       switch (message.type) {
         case 'connected':
-          console.log(message.message);
           updateDebug({ status: 'Connected (Server ACK)' });
           break;
         case 'presentation_loaded':
-          console.log(message.message);
           updateDebug({ status: 'Presentation Loaded' });
           if (currentSlideIndex === 0) {
             newWs.send(JSON.stringify({ type: 'slide_start', slide_number: 1 }));
@@ -288,184 +245,186 @@ export default function PresentPage() {
         case 'audio_chunk':
           try {
             const audioData = decodeBase64(message.audio_data);
-            updateDebug({ 
-              chunksReceived: prev => prev.chunksReceived + 1,
-              lastChunkSize: audioData.byteLength 
-            });
+            updateDebug({ chunksReceived: p => p + 1, lastChunkSize: audioData.byteLength });
             if (audioContext.current || (typeof window !== 'undefined' && (window.AudioContext || (window as any).webkitAudioContext))) {
-                if(!audioContext.current || audioContext.current.state === 'closed'){
-                    audioContext.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-                }
+                if(!audioContext.current || audioContext.current.state === 'closed'){ audioContext.current = new (window.AudioContext || (window as any).webkitAudioContext)(); }
               const audioBuffer = await audioContext.current.decodeAudioData(audioData);
               audioQueue.current.push(audioBuffer);
               updateDebug({ audioPlayerState: 'buffering' });
-              
-              // If not already playing, start the playback
-              if (!isPlaying.current) {
-                playNextAudioChunk(false);
-              }
+              if (!isPlaying.current) playNextAudioChunk(false);
             }
-          } catch (e) {
-            console.error('Error decoding audio data:', e);
-          }
+          } catch (e) { console.error('Error decoding audio data:', e); }
           break;
         case 'slide_started':
-           stopAudio(); // Reset audio state for the new slide
+           stopNarration();
            const slideScript = presentationScript.slides[message.slide_number - 1];
            updateDebug({ 
              currentCaption: slideScript.script, 
              totalChunks: slideScript.script_chunks.length,
              chunksReceived: 0,
            });
-           // Reset progress for the new slide
            setAudioProgress(0);
            totalAudioDuration.current = 0;
            pausedTime.current = 0;
            playbackStartTime.current = 0;
           break;
         case 'slide_done':
-            // With streaming, this message isn't needed to start playback,
-            // but can be useful for other logic, like confirming all chunks were sent.
             console.log(`Slide ${message.slide_number} audio stream finished from server.`);
           break;
         case 'qa_response':
-          const qaCaption = `Q: ${message.question}\nA: ${message.answer}`;
-          updateDebug({ currentCaption: qaCaption });
-          stopAudio(true); // Pause main narration
+          setQaAnswer(message.answer);
           try {
             const audioData = decodeBase64(message.audio_data);
-            updateDebug({ lastChunkSize: audioData.byteLength, chunksReceived: 1, totalChunks: 1 });
             if (audioContext.current) {
               const audioBuffer = await audioContext.current.decodeAudioData(audioData);
-              audioQueue.current.push(audioBuffer);
-              playNextAudioChunk(true); // Play Q&A audio
+              audioQueue.current.unshift(audioBuffer); // Use unshift to play it next
+              playNextAudioChunk(true);
             }
-          } catch (e) {
-            console.error('Error decoding Q&A audio data:', e);
-          }
+          } catch (e) { console.error('Error decoding Q&A audio data:', e); }
           break;
         case 'error':
-          console.error(`WebSocket Error: ${message.message}`);
           updateDebug({ status: `Error: ${message.message}` });
-          toast({
-            title: 'Presentation Error',
-            description: message.message,
-            variant: 'destructive',
-          });
+          toast({ title: 'Presentation Error', description: message.message, variant: 'destructive' });
           break;
       }
     };
 
-    newWs.onclose = () => {
-      console.log('WebSocket disconnected');
-      updateDebug({ status: 'Disconnected' });
-    };
-
-    newWs.onerror = (error) => {
-      console.error('WebSocket error:', error);
-       updateDebug({ status: 'Error' });
-    };
+    newWs.onclose = () => updateDebug({ status: 'Disconnected' });
+    newWs.onerror = (error) => { console.error('WebSocket error:', error); updateDebug({ status: 'Error' }); };
 
     return () => {
       newWs?.close();
       ws.current = null;
-      stopAudio();
-      if (audioContext.current) {
-        audioContext.current.close();
-      }
+      stopNarration();
+      stopQaAudio();
+      audioContext.current?.close();
     };
   }, [presentationScript, toast, api]);
   
   useEffect(() => {
-    if (!api) {
-      return;
-    }
+    if (!api) return;
   
     const handleSelect = () => {
       const newSlideIndex = api.selectedScrollSnap();
       if (newSlideIndex === currentSlideIndex) return;
       
       setCurrentSlideIndex(newSlideIndex);
-      stopAudio();
-      updateDebug({ 
-        currentSlide: newSlideIndex + 1,
-        currentCaption: 'Loading slide...',
-        chunksReceived: 0,
-        totalChunks: 0,
-        lastChunkSize: 0,
-      });
+      stopNarration();
+      updateDebug({ currentSlide: newSlideIndex + 1, currentCaption: 'Loading slide...', chunksReceived: 0, totalChunks: 0, lastChunkSize: 0 });
 
-      if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+      if (ws.current?.readyState === WebSocket.OPEN) {
         ws.current.send(JSON.stringify({ type: 'slide_start', slide_number: newSlideIndex + 1 }));
       }
     }
     
     api.on('select', handleSelect);
-    // Set initial slide after API is ready
     if(currentSlideIndex === -1 && presentationScript){
         setCurrentSlideIndex(0);
         updateDebug({ currentSlide: 1, currentCaption: 'Loading slide...' });
-         if (ws.current && ws.current.readyState === WebSocket.OPEN && presentationScript.slides.length > 0) {
+         if (ws.current?.readyState === WebSocket.OPEN && presentationScript.slides.length > 0) {
              ws.current.send(JSON.stringify({ type: 'slide_start', slide_number: 1 }));
          }
     }
   
-    return () => {
-      api.off('select', handleSelect);
-    };
+    return () => { api.off('select', handleSelect); };
   }, [api, currentSlideIndex, presentationScript]);
 
+  // ASR Effect
+  useEffect(() => {
+    if (!SpeechRecognition) return;
 
-  const handleFullScreenChange = () => {
-    if (typeof document !== 'undefined') {
-      setIsFullScreen(!!document.fullscreenElement);
+    recognition.current = new SpeechRecognition();
+    recognition.current.continuous = true;
+    recognition.current.interimResults = true;
+
+    recognition.current.onresult = (event: any) => {
+      let finalTranscript = '';
+      for (let i = event.resultIndex; i < event.results.length; ++i) {
+        if (event.results[i].isFinal) {
+          finalTranscript += event.results[i][0].transcript;
+        }
+      }
+      setTranscribedText(prev => prev + finalTranscript);
+    };
+
+    recognition.current.onstart = () => setIsListening(true);
+    recognition.current.onend = () => setIsListening(false);
+    recognition.current.onerror = (event: any) => {
+      console.error("Speech recognition error", event.error);
+      toast({ title: "Speech Recognition Error", description: event.error, variant: "destructive" });
+    };
+
+    return () => {
+      recognition.current?.stop();
+    };
+  }, [toast]);
+
+
+  const toggleListening = () => {
+    if (isListening) {
+      recognition.current?.stop();
+    } else {
+      setTranscribedText('');
+      setQaAnswer('');
+      recognition.current?.start();
     }
   };
 
+  const handleInterrupt = () => {
+    stopNarration(true);
+    setInterruptPopupOpen(true);
+  };
+
+  const handlePopupClose = (open: boolean) => {
+    if (!open) {
+      setInterruptPopupOpen(false);
+      recognition.current?.stop();
+      stopQaAudio();
+      setTranscribedText('');
+      setQaAnswer('');
+      if (resumeState.current) {
+        playNextAudioChunk(false);
+      }
+    }
+  };
+
+  const askQuestion = () => {
+    if (ws.current?.readyState === WebSocket.OPEN && transcribedText) {
+      recognition.current?.stop();
+      ws.current.send(JSON.stringify({ type: 'interrupt', question: transcribedText }));
+      setQaAnswer('Getting answer...');
+    }
+  }
+
+
   const toggleFullScreen = () => {
     const element = carouselContainerRef.current;
-    if (!element) return;
-
-    if (typeof document !== 'undefined') {
-        if (!document.fullscreenElement) {
-          element.requestFullscreen().catch((err) => {
-            console.error(`Error attempting to enable full-screen mode: ${err.message} (${err.name})`);
-          });
-        } else {
-          document.exitFullscreen();
-        }
+    if (!element || typeof document === 'undefined') return;
+    if (!document.fullscreenElement) {
+      element.requestFullscreen().catch(err => console.error(`FS error: ${err.message}`));
+    } else {
+      document.exitFullscreen();
     }
   };
 
   useEffect(() => {
     if(typeof document === 'undefined') return;
-    document.addEventListener('fullscreenchange', handleFullScreenChange);
+    const handleFullScreenChange = () => setIsFullScreen(!!document.fullscreenElement);
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'f') toggleFullScreen();
       if (e.key === 'Escape' && document.fullscreenElement) document.exitFullscreen();
     };
+    document.addEventListener('fullscreenchange', handleFullScreenChange);
     window.addEventListener('keydown', handleKeyDown);
-
     return () => {
       document.removeEventListener('fullscreenchange', handleFullScreenChange);
-       window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keydown', handleKeyDown);
     };
   }, []);
 
-  const handleInterrupt = () => {
-    if (ws.current && ws.current.readyState === WebSocket.OPEN) {
-      const question = "Can you explain this slide in simpler terms?"; // Hardcoded question
-      
-      // Pause current audio instead of stopping completely
-      stopAudio(true); 
-
-      ws.current.send(JSON.stringify({ type: 'interrupt', question }));
-      updateDebug({ currentCaption: `Asking: "${question}"` });
-    }
-  };
 
   if (!isAuthenticated || slides.length === 0) {
-    return null; // Or a loading/redirecting message
+    return null;
   }
 
   return (
@@ -492,13 +451,7 @@ export default function PresentPage() {
           {slides.map((slideUrl, index) => (
             <CarouselItem key={index} className="h-full">
               <div className="w-full h-full p-12 flex items-center justify-center">
-                <Image
-                  src={slideUrl}
-                  alt={`Slide ${index + 1}`}
-                  width={1920}
-                  height={1080}
-                  className="w-auto h-auto max-w-full max-h-full object-contain"
-                />
+                <Image src={slideUrl} alt={`Slide ${index + 1}`} width={1920} height={1080} className="w-auto h-auto max-w-full max-h-full object-contain" />
               </div>
             </CarouselItem>
           ))}
@@ -506,16 +459,37 @@ export default function PresentPage() {
         <CarouselPrevious className="absolute left-8 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity bg-black/50 hover:bg-black/75 border-none text-white h-12 w-12" />
         <CarouselNext className="absolute right-8 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity bg-black/50 hover:bg-black/75 border-none text-white h-12 w-12" />
       </Carousel>
+      
+      <Dialog open={isInterruptPopupOpen} onOpenChange={handlePopupClose}>
+        <DialogContent className="sm:max-w-[425px] bg-card text-card-foreground">
+          <DialogHeader>
+            <DialogTitle>Ask a Question</DialogTitle>
+            <DialogDescription>
+              Click the mic to start recording your question. The presentation will resume when you close this popup.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-4 py-4">
+            <div className="flex items-center justify-center">
+              <Button size="icon" variant={isListening ? "destructive" : "outline"} onClick={toggleListening} className="rounded-full w-16 h-16">
+                {isListening ? <MicOff className="h-8 w-8" /> : <Mic className="h-8 w-8" />}
+              </Button>
+            </div>
+            <p className="text-sm text-muted-foreground h-12 overflow-y-auto">Q: {transcribedText || "..."}</p>
+            <p className="text-sm h-24 overflow-y-auto">A: {qaAnswer || "..."}</p>
+          </div>
+          <DialogFooter>
+             <Button onClick={askQuestion} disabled={!transcribedText || isListening}>Ask</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
 
       <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-black/80 to-transparent">
         <p className="text-center text-xl whitespace-pre-wrap h-20 overflow-y-auto">{debugInfo.currentCaption}</p>
       </div>
 
        <div className="absolute bottom-0 left-0 right-0 w-full h-1 group-hover:h-2 transition-all">
-        <Progress
-          value={audioProgress}
-          className="w-full h-full bg-gray-500/50 [&>div]:bg-red-600 rounded-none"
-        />
+        <Progress value={audioProgress} className="w-full h-full bg-gray-500/50 [&gt;div]:bg-red-600 rounded-none" />
       </div>
 
       <div className="absolute top-4 right-4 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity z-10">
@@ -523,9 +497,9 @@ export default function PresentPage() {
           variant="ghost"
           size="icon"
           onClick={handleInterrupt}
-          className="text-white hover:bg-white/10 hover:text-white"
+          className="text-yellow-400 hover:bg-white/10 hover:text-yellow-300"
         >
-          <Mic className="h-5 w-5" />
+          <Hand className="h-5 w-5" />
           <span className="sr-only">Ask a question</span>
         </Button>
         <Button
@@ -537,12 +511,7 @@ export default function PresentPage() {
           {isFullScreen ? <Shrink className="h-5 w-5" /> : <Expand className="h-5 w-5" />}
           <span className="sr-only">Toggle Fullscreen</span>
         </Button>
-        <Button
-          asChild
-          variant="ghost"
-          size="icon"
-          className="text-white hover:bg-white/10 hover:text-white"
-        >
+        <Button asChild variant="ghost" size="icon" className="text-white hover:bg-white/10 hover:text-white">
           <Link href="/upload">
             <X className="h-5 w-5" />
             <span className="sr-only">Exit Presentation</span>
