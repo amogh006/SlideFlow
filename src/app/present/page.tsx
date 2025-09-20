@@ -120,10 +120,11 @@ export default function PresentPage() {
           updateDebug({ status: 'Presentation Loaded' });
           if (api) {
             const newIndex = api.selectedScrollSnap();
-            if (newIndex === currentSlideIndex) {
-              setCurrentSlideIndex(-1); // Force a re-trigger if it's already 0
+            if (newIndex !== currentSlideIndex) {
+              setCurrentSlideIndex(newIndex);
+            } else {
+              setCurrentSlideIndex(0); // Explicitly trigger for the first slide
             }
-            setCurrentSlideIndex(newIndex);
           }
           break;
 
@@ -196,14 +197,19 @@ export default function PresentPage() {
           break;
 
         case 'error':
-          console.error(`WebSocket Error: ${message.message}`);
-          updateDebug({ status: `Error: ${message.message}` });
-          toast({
-              title: 'Presentation Error',
-              description: message.message,
-              variant: 'destructive',
-          });
-          break;
+            console.error(`WebSocket Error: ${message.message}`);
+            // Special handling to ignore the "idle state" error toast.
+            if (message.message === "Cannot interrupt: current state idle") {
+                console.warn("Ignored 'idle state' interrupt error.");
+                return;
+            }
+            updateDebug({ status: `Error: ${message.message}` });
+            toast({
+                title: 'Presentation Error',
+                description: message.message,
+                variant: 'destructive',
+            });
+            break;
       }
     };
 
@@ -238,9 +244,6 @@ export default function PresentPage() {
     };
 
     api.on('select', handleSelect);
-     if (currentSlideIndex === -1 && ws.current?.readyState === WebSocket.OPEN) {
-        // This is handled by presentation_loaded now
-    }
 
     return () => {
       api.off('select', handleSelect);
@@ -249,6 +252,7 @@ export default function PresentPage() {
 
 
   useEffect(() => {
+    // A -1 index means the presentation hasn't been started yet.
     if (currentSlideIndex === -1) return;
 
     // Stop current audio playback and clear resources
@@ -310,6 +314,17 @@ export default function PresentPage() {
 
   // --- Interrupt and Speech Recognition Logic ---
   const handleInterrupt = () => {
+    // Final guard against race conditions.
+    if (!debugInfo.isServerStreaming) {
+      console.warn("Interrupt blocked: Server is not streaming.");
+      toast({
+        title: "Cannot Interrupt",
+        description: "The presentation is not actively streaming audio.",
+        variant: "destructive"
+      });
+      return;
+    }
+
     if (audioRef.current && !audioRef.current.paused) {
       audioRef.current.pause();
       ws.current?.send(JSON.stringify({ type: 'stop' }));
