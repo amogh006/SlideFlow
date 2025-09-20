@@ -142,23 +142,22 @@ export default function PresentPage() {
 
 
   const playNextAudioChunk = async (isQA = false) => {
-    if (isPlaying.current) {
-      return;
+    if (isPlaying.current || (audioQueue.current.length === 0 && !resumeState.current)) {
+        return;
     }
     
     let bufferToPlay: AudioBuffer | null = null;
+    let isResuming = false;
 
-    if (resumeState.current && !isQA) {
-        // If resuming and it's not a new Q&A, play the stored buffer
+    if (!isQA && resumeState.current) {
         bufferToPlay = resumeState.current.buffer;
         resumeState.current = null;
+        isResuming = true;
         updateDebug({ currentCaption: presentationScript?.slides[currentSlideIndex].script ?? 'Resuming...' });
     } else if (audioQueue.current.length > 0) {
-        // Otherwise, process the queue
         if (!audioContext.current || audioContext.current.state === 'closed') {
           try {
-            audioContext.current = new (window.AudioContext ||
-              (window as any).webkitAudioContext)();
+            audioContext.current = new (window.AudioContext || (window as any).webkitAudioContext)();
           } catch (e) {
             console.error('Web Audio API is not supported in this browser', e);
             return;
@@ -166,20 +165,26 @@ export default function PresentPage() {
         }
         await audioContext.current.resume();
 
-        const totalLength = audioQueue.current.reduce((acc, buffer) => acc + buffer.length, 0);
-        if(totalLength === 0) return;
+        // For streaming, we play one chunk at a time.
+        // For QA, we concatenate as it's usually a single response.
+        if (isQA) {
+            const totalLength = audioQueue.current.reduce((acc, buffer) => acc + buffer.length, 0);
+            if(totalLength === 0) return;
 
-        const concatenatedBuffer = audioContext.current.createBuffer(
-            1, totalLength, audioContext.current.sampleRate
-        );
-        const outputData = concatenatedBuffer.getChannelData(0);
-        let offset = 0;
-        for (const buffer of audioQueue.current) {
-            outputData.set(buffer.getChannelData(0), offset);
-            offset += buffer.length;
+            const concatenatedBuffer = audioContext.current.createBuffer(
+                1, totalLength, audioContext.current.sampleRate
+            );
+            const outputData = concatenatedBuffer.getChannelData(0);
+            let offset = 0;
+            for (const buffer of audioQueue.current) {
+                outputData.set(buffer.getChannelData(0), offset);
+                offset += buffer.length;
+            }
+            audioQueue.current = [];
+            bufferToPlay = concatenatedBuffer;
+        } else {
+            bufferToPlay = audioQueue.current.shift()!;
         }
-        audioQueue.current = [];
-        bufferToPlay = concatenatedBuffer;
     } else {
         // Nothing to play
         return;
@@ -188,14 +193,17 @@ export default function PresentPage() {
     if (!bufferToPlay) return;
 
     if (!isQA) {
-        mainAudioBuffer.current = bufferToPlay; // Store the buffer for pausing
+        mainAudioBuffer.current = bufferToPlay; // Store the current chunk for pausing logic
     }
 
     isPlaying.current = true;
     updateDebug({ audioPlayerState: 'playing' });
-    
-    totalAudioDuration.current = bufferToPlay.duration;
 
+    if (!isResuming) {
+        // In streaming, total duration becomes a running total.
+        totalAudioDuration.current += bufferToPlay.duration;
+    }
+    
     const source = audioContext.current!.createBufferSource();
     source.buffer = bufferToPlay;
     source.connect(audioContext.current!.destination);
@@ -203,26 +211,39 @@ export default function PresentPage() {
     source.onended = () => {
       sourceNode.current = null;
       isPlaying.current = false;
-      mainAudioBuffer.current = null;
-      updateDebug({ audioPlayerState: 'idle' });
-      setAudioProgress(0);
+      mainAudioBuffer.current = null; // Clear the chunk that just played
       
-      // After Q&A is done, try to resume main audio
-      if(isQA && resumeState.current) {
-        playNextAudioChunk(false);
+      // If it was a QA audio, we might need to resume main audio.
+      if(isQA) {
+        updateDebug({ audioPlayerState: 'idle' });
+        if(resumeState.current) {
+            playNextAudioChunk(false);
+        } else {
+            stopAudio();
+        }
       } else {
-        stopAudio();
+        // It was a narration slide. Check if there are more chunks to play.
+        if (audioQueue.current.length > 0) {
+            playNextAudioChunk(false);
+        } else {
+            updateDebug({ audioPlayerState: 'idle' });
+             // Don't reset progress bar here, wait for slide change
+        }
       }
     };
 
     source.start(0, 0); // Start from the beginning
     sourceNode.current = source;
-    playbackStartTime.current = audioContext.current!.currentTime;
-    pausedTime.current = 0;
 
+    if (isResuming) {
+        playbackStartTime.current = audioContext.current!.currentTime - pausedTime.current;
+    } else {
+        playbackStartTime.current = audioContext.current!.currentTime;
+    }
+    
     if (progressInterval.current) clearInterval(progressInterval.current);
     progressInterval.current = setInterval(() => {
-      if (audioContext.current && isPlaying.current) {
+      if (audioContext.current && (isPlaying.current || resumeState.current)) {
         const elapsedTime = (audioContext.current.currentTime - playbackStartTime.current);
         const progress = (elapsedTime / totalAudioDuration.current) * 100;
         setAudioProgress(Math.min(progress, 100));
@@ -278,6 +299,11 @@ export default function PresentPage() {
               const audioBuffer = await audioContext.current.decodeAudioData(audioData);
               audioQueue.current.push(audioBuffer);
               updateDebug({ audioPlayerState: 'buffering' });
+              
+              // If not already playing, start the playback
+              if (!isPlaying.current) {
+                playNextAudioChunk(false);
+              }
             }
           } catch (e) {
             console.error('Error decoding audio data:', e);
@@ -291,18 +317,21 @@ export default function PresentPage() {
              totalChunks: slideScript.script_chunks.length,
              chunksReceived: 0,
            });
+           // Reset progress for the new slide
+           setAudioProgress(0);
+           totalAudioDuration.current = 0;
+           pausedTime.current = 0;
+           playbackStartTime.current = 0;
           break;
         case 'slide_done':
-            const activeSlide = api?.selectedScrollSnap() ?? -1;
-            // Only play if the 'done' message is for the currently active slide
-           if (!message.is_qa && message.slide_number === activeSlide + 1) {
-             playNextAudioChunk(false);
-           }
+            // With streaming, this message isn't needed to start playback,
+            // but can be useful for other logic, like confirming all chunks were sent.
+            console.log(`Slide ${message.slide_number} audio stream finished from server.`);
           break;
         case 'qa_response':
           const qaCaption = `Q: ${message.question}\nA: ${message.answer}`;
           updateDebug({ currentCaption: qaCaption });
-          // Don't stop here, playNextAudioChunk will handle it
+          stopAudio(true); // Pause main narration
           try {
             const audioData = decodeBase64(message.audio_data);
             updateDebug({ lastChunkSize: audioData.byteLength, chunksReceived: 1, totalChunks: 1 });
@@ -523,3 +552,5 @@ export default function PresentPage() {
     </div>
   );
 }
+
+    
