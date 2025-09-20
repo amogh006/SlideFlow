@@ -31,6 +31,7 @@ interface DebugInfo {
   audioPlayerState: 'idle' | 'playing' | 'paused' | 'buffering' | 'stopped';
   isMainAudioPlaying: boolean;
   isQaAudioPlaying: boolean;
+  isServerStreaming: boolean;
   currentCaption: string;
 }
 
@@ -76,6 +77,7 @@ export default function PresentPage() {
     audioPlayerState: 'idle',
     isMainAudioPlaying: false,
     isQaAudioPlaying: false,
+    isServerStreaming: false,
     currentCaption: '',
   });
 
@@ -216,11 +218,13 @@ export default function PresentPage() {
           if (slideScript) {
             updateDebug({
               currentCaption: slideScript.script,
+              isServerStreaming: true,
             });
           }
           break;
         case 'slide_done':
           console.log(`Slide ${message.slide_number} audio stream finished from server.`);
+          updateDebug({ isServerStreaming: false });
           break;
         case 'qa_response':
            const qaCaption = `Q: ${message.question}\nA: ${message.answer}`;
@@ -249,7 +253,7 @@ export default function PresentPage() {
 
     newWs.onclose = () => {
       console.log('WebSocket disconnected');
-      updateDebug({ status: 'Disconnected' });
+      updateDebug({ status: 'Disconnected', isServerStreaming: false });
       stopMainAudio();
       stopQA();
     };
@@ -281,6 +285,7 @@ export default function PresentPage() {
       updateDebug({
         currentSlide: newSlideIndex + 1,
         currentCaption: 'Loading slide...',
+        isServerStreaming: false,
       });
 
       if (ws.current && ws.current.readyState === WebSocket.OPEN) {
@@ -345,10 +350,10 @@ export default function PresentPage() {
   // --- Interrupt and Speech Recognition Logic ---
 
   const handleInterrupt = () => {
-    if (!debugInfo.isMainAudioPlaying) {
+    if (!debugInfo.isServerStreaming) {
       toast({
         title: "Cannot Interrupt",
-        description: "Interrupt is only available when presentation audio is playing.",
+        description: "You can only interrupt when the server is actively streaming audio.",
         variant: "destructive",
       });
       return;
@@ -475,6 +480,10 @@ export default function PresentPage() {
               <td className="font-mono">{debugInfo.isQaAudioPlaying ? 'Playing' : 'Stopped'}</td>
             </tr>
             <tr>
+              <td className="pr-2 opacity-70">Server:</td>
+              <td className="font-mono">{debugInfo.isServerStreaming ? 'Streaming' : 'Idle'}</td>
+            </tr>
+            <tr>
               <td className="pr-2 opacity-70 align-top">Caption:</td>
               <td className="font-mono h-20 overflow-y-auto block">
                 {debugInfo.currentCaption}
@@ -560,7 +569,7 @@ export default function PresentPage() {
           variant="ghost"
           size="icon"
           onClick={handleInterrupt}
-          disabled={!debugInfo.isMainAudioPlaying}
+          disabled={!debugInfo.isServerStreaming}
           className="text-yellow-400 hover:bg-white/10 hover:text-yellow-300 disabled:opacity-50 disabled:cursor-not-allowed"
         >
           <Hand className="h-5 w-5" />
@@ -570,7 +579,7 @@ export default function PresentPage() {
           variant="ghost"
           size="icon"
           onClick={toggleFullScreen}
-          className="text-white hover:bg-white/10 hover:text-white"
+          className="text-white hover:bg.white/10 hover:text-white"
         >
           {isFullScreen ? (
             <Shrink className="h-5 w-5" />
@@ -583,7 +592,7 @@ export default function PresentPage() {
           asChild
           variant="ghost"
           size="icon"
-          className="text-white hover:bg-white/10 hover:text-white"
+          className="text-white hover:bg.white/10 hover:text-white"
         >
           <Link href="/upload">
             <X className="h-5 w-5" />
