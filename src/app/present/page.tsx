@@ -60,6 +60,7 @@ export default function PresentPage() {
 
   // --- Audio Handling State & Refs ---
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
   const [audioProgress, setAudioProgress] = useState(0);
 
   // Interrupt (Q&A) state
@@ -118,18 +119,17 @@ export default function PresentPage() {
           console.log(message.message);
           updateDebug({ status: 'Presentation Loaded' });
           if (api) {
-            setCurrentSlideIndex(api.selectedScrollSnap());
+             const newIndex = api.selectedScrollSnap();
+             setCurrentSlideIndex(newIndex);
           }
           break;
 
         case 'slide_started':
           if (audioRef.current) {
             audioRef.current.src = '';
+            URL.revokeObjectURL(audioRef.current.src);
           }
-          const audioChunks: Blob[] = [];
-          (newWs as any).audioChunks = audioChunks;
-          (newWs as any).isStreaming = true;
-
+          audioChunksRef.current = [];
           updateDebug({
             isServerStreaming: true,
             audioPlayerState: 'buffering',
@@ -141,16 +141,25 @@ export default function PresentPage() {
           break;
 
         case 'audio_chunk':
-          if ((newWs as any).isStreaming) {
-            const audioData = decodeBase64(message.audio_data);
-            (newWs as any).audioChunks.push(new Blob([audioData], { type: 'audio/mpeg' }));
+          const audioData = decodeBase64(message.audio_data);
+          audioChunksRef.current.push(new Blob([audioData], { type: 'audio/mpeg' }));
 
-            // If this is the first chunk, start playback
-            if (audioRef.current && !audioRef.current.src) {
-              const firstChunkBlob = (newWs as any).audioChunks[0];
-              audioRef.current.src = URL.createObjectURL(firstChunkBlob);
-              audioRef.current.play().catch(e => console.error("Audio play failed", e));
-              updateDebug({ audioPlayerState: 'playing' });
+          if (audioRef.current) {
+            const fullBlob = new Blob(audioChunksRef.current, { type: 'audio/mpeg' });
+            const objectURL = URL.createObjectURL(fullBlob);
+            
+            // If it's not already playing, start it
+            if (audioRef.current.paused) {
+                audioRef.current.src = objectURL;
+                audioRef.current.play().catch(e => console.error("Audio play failed", e));
+            } else {
+                // If it IS playing, we need to update the source without interruption
+                const currentTime = audioRef.current.currentTime;
+                // Revoke the old URL to prevent memory leaks
+                URL.revokeObjectURL(audioRef.current.src);
+                audioRef.current.src = objectURL;
+                audioRef.current.currentTime = currentTime;
+                audioRef.current.play().catch(e => console.error("Audio play failed on chunk update", e));
             }
           }
           break;
@@ -158,15 +167,6 @@ export default function PresentPage() {
         case 'slide_done':
           console.log(`Slide ${message.slide_number} audio stream finished from server.`);
           updateDebug({ isServerStreaming: false });
-          (newWs as any).isStreaming = false;
-
-          if (audioRef.current) {
-            const allChunks = new Blob((newWs as any).audioChunks, { type: 'audio/mpeg' });
-            const currentPlayTime = audioRef.current.currentTime;
-            audioRef.current.src = URL.createObjectURL(allChunks);
-            audioRef.current.currentTime = currentPlayTime;
-            audioRef.current.play().catch(e => console.error("Audio play failed", e));
-          }
           break;
 
         case 'qa_response':
@@ -178,13 +178,20 @@ export default function PresentPage() {
           console.error(`WebSocket Error: ${message.message}`);
           updateDebug({ status: `Error: ${message.message}` });
           if (message.message === 'Cannot interrupt when state is idle.') {
+             toast({
+                title: 'Cannot Interrupt',
+                description: 'The presentation is not actively speaking.',
+                variant: 'destructive',
+            });
+            // Close the dialog if it was opened erroneously
             setInterruptOpen(false);
+          } else {
+            toast({
+                title: 'Presentation Error',
+                description: message.message,
+                variant: 'destructive',
+            });
           }
-          toast({
-            title: 'Presentation Error',
-            description: message.message,
-            variant: 'destructive',
-          });
           break;
       }
     };
@@ -200,6 +207,9 @@ export default function PresentPage() {
     };
 
     return () => {
+      if (audioRef.current?.src) {
+        URL.revokeObjectURL(audioRef.current.src);
+      }
       newWs?.close();
       ws.current = null;
     };
@@ -212,12 +222,12 @@ export default function PresentPage() {
 
     const handleSelect = () => {
       const newSlideIndex = api.selectedScrollSnap();
-       if (newSlideIndex === currentSlideIndex) return;
+      if (newSlideIndex === currentSlideIndex) return;
       setCurrentSlideIndex(newSlideIndex);
     };
 
     api.on('select', handleSelect);
-     if (currentSlideIndex === -1) {
+     if (currentSlideIndex === -1 && ws.current?.readyState === WebSocket.OPEN) {
         // This is handled by presentation_loaded now
     }
 
@@ -230,11 +240,14 @@ export default function PresentPage() {
   useEffect(() => {
     if (currentSlideIndex === -1) return;
 
-    // Stop current audio playback
+    // Stop current audio playback and clear resources
     if (audioRef.current) {
       audioRef.current.pause();
+      URL.revokeObjectURL(audioRef.current.src);
       audioRef.current.src = '';
     }
+    audioChunksRef.current = [];
+
 
     updateDebug({
       currentSlide: currentSlideIndex + 1,
@@ -284,9 +297,10 @@ export default function PresentPage() {
 
   // --- Interrupt and Speech Recognition Logic ---
   const handleInterrupt = () => {
+    // We only send the interrupt message to the server, which then pauses itself.
+    // We also pause the audio on the client side.
     if (audioRef.current && !audioRef.current.paused) {
       audioRef.current.pause();
-      updateDebug({ audioPlayerState: 'paused' });
       ws.current?.send(JSON.stringify({ type: 'stop' }));
       setTranscribedText('');
       setInterruptOpen(true);
@@ -311,8 +325,9 @@ export default function PresentPage() {
   const closeInterrupt = () => {
     stopRecording();
     setInterruptOpen(false);
-    if (audioRef.current) {
-      audioRef.current.play().catch(e => console.error("Resume play failed", e));
+    // Resume client-side audio
+    if (audioRef.current && audioRef.current.src) {
+        audioRef.current.play().catch(e => console.error("Resume play failed", e));
     }
   };
 
@@ -452,12 +467,9 @@ export default function PresentPage() {
           onPause={() => updateDebug({ audioPlayerState: 'paused' })}
           onEnded={() => {
             updateDebug({ audioPlayerState: 'ended' });
-            // If server is done streaming, we're done. Otherwise, this was just a chunk.
-            if (!debugInfo.isServerStreaming) {
-               // Full audio finished
-            }
           }}
           onTimeUpdate={handleAudioTimeUpdate}
+          onEmptied={() => setAudioProgress(0)}
         />
 
       <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-black/80 to-transparent">
