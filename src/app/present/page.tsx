@@ -89,7 +89,11 @@ export default function PresentPage() {
     }
     if (sourceNode.current) {
       sourceNode.current.onended = null;
-      sourceNode.current.stop();
+      try {
+        sourceNode.current.stop();
+      } catch (e) {
+        console.warn("Audio stop error:", e)
+      }
       sourceNode.current = null;
     }
     audioQueue.current = [];
@@ -111,7 +115,7 @@ export default function PresentPage() {
     if (!audioContext.current || audioContext.current.state === 'closed') {
       try {
         audioContext.current = new (window.AudioContext ||
-          window.webkitAudioContext)();
+          (window as any).webkitAudioContext)();
       } catch (e) {
         console.error('Web Audio API is not supported in this browser', e);
         isPlaying.current = false;
@@ -124,6 +128,11 @@ export default function PresentPage() {
     
     // Concatenate all buffers in the queue
     const totalLength = audioQueue.current.reduce((acc, buffer) => acc + buffer.length, 0);
+    if(totalLength === 0) {
+        isPlaying.current = false;
+        updateDebug({ audioPlayerState: 'idle' });
+        return;
+    }
     const outputBuffer = audioContext.current.createBuffer(
         1,
         totalLength,
@@ -193,7 +202,6 @@ export default function PresentPage() {
         case 'presentation_loaded':
           console.log(message.message);
           updateDebug({ status: 'Presentation Loaded' });
-          // Now that presentation is loaded, start the first slide
           if (currentSlideIndex === 0) {
             newWs.send(JSON.stringify({ type: 'slide_start', slide_number: 1 }));
           }
@@ -205,9 +213,9 @@ export default function PresentPage() {
               chunksReceived: prev => prev.chunksReceived + 1,
               lastChunkSize: audioData.byteLength 
             });
-            if (audioContext.current || (typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext))) {
+            if (audioContext.current || (typeof window !== 'undefined' && (window.AudioContext || (window as any).webkitAudioContext))) {
                 if(!audioContext.current || audioContext.current.state === 'closed'){
-                    audioContext.current = new (window.AudioContext || window.webkitAudioContext)();
+                    audioContext.current = new (window.AudioContext || (window as any).webkitAudioContext)();
                 }
               const audioBuffer = await audioContext.current.decodeAudioData(audioData);
               audioQueue.current.push(audioBuffer);
@@ -218,11 +226,22 @@ export default function PresentPage() {
           }
           break;
         case 'slide_started':
-          const slideScript = presentationScript.slides[message.slide_number - 1];
-          updateDebug({ currentCaption: slideScript.script, totalChunks: slideScript.script_chunks.length });
+          const currentSlide = api?.selectedScrollSnap() ?? -1;
+          // Only process if it's for the current slide
+          if (message.slide_number === currentSlide + 1) {
+            stopAudio(); // Reset audio state for the new slide
+            const slideScript = presentationScript.slides[message.slide_number - 1];
+            updateDebug({ 
+              currentCaption: slideScript.script, 
+              totalChunks: slideScript.script_chunks.length,
+              chunksReceived: 0,
+            });
+          }
           break;
         case 'slide_done':
-           if (!message.is_qa) {
+            const activeSlide = api?.selectedScrollSnap() ?? -1;
+            // Only play if the 'done' message is for the currently active slide
+           if (!message.is_qa && message.slide_number === activeSlide + 1) {
              playNextAudioChunk();
            }
           break;
@@ -272,7 +291,7 @@ export default function PresentPage() {
         audioContext.current.close();
       }
     };
-  }, [presentationScript, toast, currentSlideIndex]);
+  }, [presentationScript, toast, currentSlideIndex, api]);
   
   useEffect(() => {
     if (!api) {
@@ -287,7 +306,7 @@ export default function PresentPage() {
       stopAudio();
       updateDebug({ 
         currentSlide: newSlideIndex + 1,
-        currentCaption: '',
+        currentCaption: 'Loading slide...',
         chunksReceived: 0,
         totalChunks: 0,
         lastChunkSize: 0,
@@ -302,8 +321,8 @@ export default function PresentPage() {
     // Set initial slide after API is ready
     if(currentSlideIndex === -1 && presentationScript){
         setCurrentSlideIndex(0);
-        updateDebug({ currentSlide: 1 });
-         if (ws.current && ws.current.readyState === WebSocket.OPEN) {
+        updateDebug({ currentSlide: 1, currentCaption: 'Loading slide...' });
+         if (ws.current && ws.current.readyState === WebSocket.OPEN && presentationScript.slides.length > 0) {
              ws.current.send(JSON.stringify({ type: 'slide_start', slide_number: 1 }));
          }
     }
@@ -446,4 +465,3 @@ export default function PresentPage() {
       </div>
     </div>
   );
-}
